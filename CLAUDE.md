@@ -24,23 +24,31 @@ sbt test       # テスト実行
 ### 主要コンポーネント
 
 ```
-src/main/scala/
-├── indexeddataframe/
-│   ├── InternalIndexedDF.scala   # インデックス付きパーティションのコアデータ構造
-│   ├── Utils.scala               # ユーティリティとIRDD（カスタムRDD）
-│   ├── implicits.scala           # Dataset拡張のimplicit変換
-│   ├── strategies.scala          # Catalyst物理プランへの変換戦略
-│   ├── execution/
-│   │   └── operators.scala       # 物理演算子（SparkPlan実装）
-│   └── logical/
-│       ├── operators.scala       # 論理演算子（LogicalPlan実装）
-│       └── rules.scala           # Catalyst最適化ルール
-└── org/apache/spark/sql/
-    ├── IndexedDatasetFunctions.scala  # DatasetへのAPI拡張
-    └── InMemoryRelationMatcher.scala  # キャッシュ検出用パターンマッチャー
+src/main/
+├── java/indexeddataframe/
+│   └── RowBatch.java             # オフヒープメモリ管理（行データ格納）
+└── scala/
+    ├── indexeddataframe/
+    │   ├── InternalIndexedDF.scala   # インデックス付きパーティションのコアデータ構造
+    │   ├── Utils.scala               # ユーティリティとIRDD（カスタムRDD）
+    │   ├── implicits.scala           # Dataset拡張のimplicit変換
+    │   ├── strategies.scala          # Catalyst物理プランへの変換戦略
+    │   ├── execution/
+    │   │   └── operators.scala       # 物理演算子（SparkPlan実装）
+    │   └── logical/
+    │       ├── operators.scala       # 論理演算子（LogicalPlan実装）
+    │       └── rules.scala           # Catalyst最適化ルール
+    └── org/apache/spark/sql/
+        ├── IndexedDatasetFunctions.scala  # DatasetへのAPI拡張
+        └── InMemoryRelationMatcher.scala  # キャッシュ検出用パターンマッチャー
 ```
 
 ### データ構造
+
+- **RowBatch** (`RowBatch.java`): オフヒープメモリ上の行データストレージ
+  - `Platform.allocateMemory()`でJVMヒープ外に4MBバッチを確保
+  - GCの影響を受けず、大量データでも安定したパフォーマンス
+  - `Platform.copyMemory()`による高速なメモリ操作
 
 - **InternalIndexedDF**: パーティション単位のインデックス付きデータ構造
   - `TrieMap[Long, Long]`: キー → 行ポインタのインデックス（CTrie）
