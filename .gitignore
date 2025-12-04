@@ -3,4 +3,9 @@
 *.jar
 .idea
 project/target
+project/project
 target
+.metals/
+.bloop/
+.bsp/
+.vscode/

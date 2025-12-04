@@ -1,23 +1,23 @@
-
 package indexeddataframe
 
 import org.apache.spark.sql._
-import org.scalatest.FunSuite
+import org.scalatest.funsuite.AnyFunSuite
 import indexeddataframe.implicits._
 import indexeddataframe.logical.ConvertToIndexedOperators
 
 
-class IndexedDFTest extends FunSuite {
+class IndexedDFTest extends AnyFunSuite {
 
-  val sparkSession = SparkSession.builder.
-    master("local")
+  val sparkSession = SparkSession.builder
+    .master("local")
     .appName("spark test app")
     .config("spark.sql.shuffle.partitions", "3")
+    .config("spark.sql.adaptive.enabled", "false")
     .getOrCreate()
 
   import sparkSession.implicits._
-  sparkSession.experimental.extraStrategies = (Seq(IndexedOperators) ++ sparkSession.experimental.extraStrategies)
-  sparkSession.experimental.extraOptimizations = (Seq(ConvertToIndexedOperators) ++ sparkSession.experimental.extraOptimizations)
+  sparkSession.experimental.extraStrategies ++= Seq(IndexedOperators)
+  sparkSession.experimental.extraOptimizations ++= Seq(ConvertToIndexedOperators)
 
   test("createIndex") {
 
@@ -96,7 +96,11 @@ class IndexedDFTest extends FunSuite {
 
   test("join2") {
 
-    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag")
+    val myDf = Seq(
+      (1234, 12345, "abcd"),
+      (1234, 102, "abcde"),
+      (1237, 120, "abcdef")
+    ).toDF("src", "dst", "tag")
     val df2 = Seq((1234, "test")).toDF("src", "data")
 
     val myIDF = myDf.createIndex(1).cache()

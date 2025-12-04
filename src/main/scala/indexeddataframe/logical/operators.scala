@@ -12,15 +12,25 @@ import org.apache.spark.util.LongAccumulator
 
 case class CreateIndex(val colNo: Int, child: LogicalPlan) extends UnaryNode with IndexedOperator {
   override def output: Seq[Attribute] = child.output
+  override protected def withNewChildInternal(
+      newChild: LogicalPlan
+  ): CreateIndex = copy(child = newChild)
 }
 
 case class AppendRows(left: LogicalPlan, right: LogicalPlan) extends BinaryNode with IndexedOperator {
 
   override def output: Seq[Attribute] = left.output
+  override protected def withNewChildrenInternal(
+      newLeft: LogicalPlan,
+      newRight: LogicalPlan
+  ): AppendRows =
+    copy(left = newLeft, right = newRight)
 }
 
 case class GetRows(val key: AnyVal, child: LogicalPlan) extends UnaryNode with IndexedOperator {
   override def output: Seq[Attribute] = child.output
+  override protected def withNewChildInternal(newChild: LogicalPlan): GetRows =
+    copy(child = newChild)
 }
 
 trait IndexedOperator extends LogicalPlan {
@@ -79,6 +89,11 @@ case class IndexedBlockRDD(
   */
 
   override def producedAttributes: AttributeSet = outputSet
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[LogicalPlan]
+  ): IndexedBlockRDD = this
+
 /*
   override lazy val statistics: Statistics = {
     val batchStats: LongAccumulator = child.sqlContext.sparkContext.longAccumulator
@@ -99,8 +114,17 @@ case class IndexedJoin(left: LogicalPlan,
   extends BinaryNode with IndexedOperator {
 
   override def output: Seq[Attribute] = left.output ++ right.output
+  override protected def withNewChildrenInternal(
+      newLeft: LogicalPlan,
+      newRight: LogicalPlan
+  ): IndexedJoin =
+    copy(left = newLeft, right = newRight)
 }
 
 case class IndexedFilter(condition: Expression, child:IndexedOperator) extends UnaryNode with IndexedOperator {
   override def output: Seq[Attribute] = child.output
+  override protected def withNewChildInternal(
+      newChild: LogicalPlan
+  ): IndexedFilter =
+    copy(child = newChild.asInstanceOf[IndexedOperator])
 }

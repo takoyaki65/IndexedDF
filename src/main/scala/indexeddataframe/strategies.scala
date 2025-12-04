@@ -1,8 +1,8 @@
 
 package indexeddataframe
 
-import org.apache.spark.sql.Strategy
-import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan}
+import org.apache.spark.sql.execution.SparkStrategy
+import org.apache.spark.sql.catalyst.plans.logical.{Join, JoinHint, LogicalPlan}
 import org.apache.spark.sql.execution.SparkPlan
 import indexeddataframe.execution._
 import indexeddataframe.logical._
@@ -12,7 +12,7 @@ import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 /**
   * strategies for the operators applied on indexed dataframes
   */
-object IndexedOperators extends Strategy {
+object IndexedOperators extends SparkStrategy {
   def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case CreateIndex(colNo, child) => CreateIndexExec(colNo, planLater(child)) :: Nil
     case AppendRows(left, right) => AppendRowsExec(planLater(left), planLater(right)) :: Nil
@@ -31,8 +31,8 @@ object IndexedOperators extends Strategy {
       */
     case IndexedFilter(condition, child) => IndexedFilterExec(condition, planLater(child)) :: Nil
     case IndexedJoin(left, right, joinType, condition) =>
-      Join(left, right, joinType, condition) match {
-        case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, lChild, rChild) => {
+      Join(left, right, joinType, condition, JoinHint.NONE) match {
+        case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, lChild, rChild, _) => {
           // compute the index of the left side keys == column number
           var leftColNo = 0
           var i = 0

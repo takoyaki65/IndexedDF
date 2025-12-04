@@ -3,7 +3,7 @@ package indexeddataframe.logical
 import indexeddataframe.execution.IndexedOperatorExec
 import indexeddataframe.{IRDD, Utils}
 import org.apache.spark.sql.InMemoryRelationMatcher
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, LocalRelation, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, JoinHint, LocalRelation, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, Expression, IsNotNull}
@@ -15,8 +15,8 @@ import scala.collection.concurrent.TrieMap
 
 object IndexLocalRelation extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case CreateIndex(colNo, LocalRelation(output, data, _)) =>
-      IndexedLocalRelation(output, data)
+    case CreateIndex(colNo, lr: LocalRelation) =>
+      IndexedLocalRelation(lr.output, lr.data)
   }
 }
 
@@ -83,17 +83,16 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
       right : LogicalPlan,
       joinType : JoinType,
       condition : Option[Expression]): Boolean = {
-    Join(left, right, joinType, condition) match {
-      case ExtractEquiJoinKeys(_, leftKeys, _, _, lChild, _) => {
+    Join(left, right, joinType, condition, JoinHint.NONE) match {
+      case ExtractEquiJoinKeys(_, leftKeys, _, _, _, lChild, _, _) =>
         var leftColNo = 0
         var i = 0
         lChild.output.foreach(col => {
           if (col == leftKeys(0)) leftColNo = i
           i += 1
         })
-
         leftColNo == left.asInstanceOf[IndexedBlockRDD].rdd.colNo
-      }
+      case _ => false
     }
   }
 
@@ -102,17 +101,16 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
       right : IndexedBlockRDD,
       joinType : JoinType,
       condition : Option[Expression]): Boolean = {
-    Join(left, right, joinType, condition) match {
-      case ExtractEquiJoinKeys(_, _, rightKeys, _, _, rChild) => {
+    Join(left, right, joinType, condition, JoinHint.NONE) match {
+      case ExtractEquiJoinKeys(_, _, rightKeys, _, _, _, rChild, _) =>
         var rightColNo = 0
         var i = 0
         rChild.output.foreach(col => {
           if (col == rightKeys(0)) rightColNo = i
           i += 1
         })
-
         rightColNo == right.asInstanceOf[IndexedBlockRDD].rdd.colNo
-      }
+      case _ => false
     }
   }
 
@@ -140,10 +138,10 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     /**
       * apply indexed join only on indexed data
       */
-    case Join(left : IndexedBlockRDD, right, joinType, condition) if joiningIndexedColumnLeft(left, right, joinType, condition) =>
+    case Join(left : IndexedBlockRDD, right, joinType, condition, _) if joiningIndexedColumnLeft(left, right, joinType, condition) =>
       IndexedJoin(left.asInstanceOf[IndexedOperator], right, joinType, condition)
 
-    case Join(left, right : IndexedBlockRDD, joinType, condition) if joiningIndexedColumnRight(left, right, joinType, condition) =>
+    case Join(left, right: IndexedBlockRDD, joinType, condition, _) if joiningIndexedColumnRight(left, right, joinType, condition) =>
       IndexedJoin(left, right.asInstanceOf[IndexedOperator], joinType, condition)
 
 
@@ -163,7 +161,7 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
       IndexedFilter(condition, child.asInstanceOf[IndexedOperator])
 
     case Join(left @ IndexedFilter(conditionLeft: EqualTo, _), right @ IndexedFilter(conditionRight: EqualTo, rightChild),
-      joinType, Some(condition: EqualTo)) if joinSameFilterColumns(condition, conditionLeft, conditionRight) =>
+      joinType, Some(condition: EqualTo), _) if joinSameFilterColumns(condition, conditionLeft, conditionRight) =>
         IndexedJoin(left, rightChild.asInstanceOf[IndexedOperator], joinType, Some(condition))
   }
 }

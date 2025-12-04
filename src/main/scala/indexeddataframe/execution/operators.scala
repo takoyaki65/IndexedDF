@@ -83,8 +83,13 @@ case class CreateIndexExec(override val indexColNo: Int, child: SparkPlan) exten
   override def output: Seq[Attribute] = child.output
 
   // we need to repartition when creating the Index in order to know how to partition the appends and join probes
-  override def outputPartitioning = HashPartitioning(Seq(child.output(indexColNo)), sqlContext.getConf("spark.sql.shuffle.partitions").toInt)
+  override def outputPartitioning = HashPartitioning(Seq(child.output(indexColNo)), conf.numShufflePartitions)
   override def requiredChildDistribution: Seq[Distribution] = Seq(ClusteredDistribution(Seq(child.output(indexColNo))))
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): CreateIndexExec =
+    copy(child = newChildren.head)
 
   override def executeIndexed(): IRDD = {
     logger.debug("executing the createIndex operator")
@@ -114,6 +119,11 @@ case class AppendRowsExec(left: SparkPlan, right: SparkPlan) extends BinaryExecN
   override def outputPartitioning = left.outputPartitioning
   override def requiredChildDistribution: Seq[Distribution] = Seq(ClusteredDistribution(Seq(output(distributionOutput))),
                                                               ClusteredDistribution(Seq(right.output(distributionOutput))))
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): AppendRowsExec =
+    copy(left = newChildren(0), right = newChildren(1))
 
   override def executeIndexed(): IRDD = {
     logger.debug("executing the appendRows operator")
@@ -146,6 +156,10 @@ case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, child: Spa
   override def indexColNo = child.asInstanceOf[IndexedOperatorExec].indexColNo
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): IndexedBlockRDDScanExec = this
+
   override def executeIndexed(): IRDD = {
     logger.debug("executing the cache() operator")
 
@@ -160,6 +174,11 @@ case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, child: Spa
   */
 case class GetRowsExec(key: AnyVal, child: SparkPlan) extends UnaryExecNode {
   override def output: Seq[Attribute] = child.output
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): GetRowsExec =
+    copy(child = newChildren.head)
 
   override def doExecute(): RDD[InternalRow] = {
     val rdd = child.asInstanceOf[IndexedOperatorExec].executeIndexed()
@@ -179,6 +198,12 @@ case class IndexedFilterExec(condition: Expression, child: SparkPlan) extends Un
   override def output: Seq[Attribute] = child.output
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): IndexedFilterExec =
+    copy(child = newChildren.head)
+
   override def doExecute(): RDD[InternalRow] = {
     condition match {
       case EqualTo(_, literalValue: Literal) => {
@@ -211,6 +236,11 @@ case class IndexedShuffledEquiJoinExec(left: SparkPlan, right: SparkPlan, leftCo
   // We're using this to force spark to shuffle the right relation in a similar way
   // to the left indexed relation such that we can correctly do the join
   override def requiredChildDistribution: Seq[Distribution] =  Seq(ClusteredDistribution(leftKeys), ClusteredDistribution(rightKeys))
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): IndexedShuffledEquiJoinExec =
+    copy(left = newChildren(0), right = newChildren(1))
 
   override def doExecute(): RDD[InternalRow] = {
     logger.debug("in the Shuffled JOIN operator")
@@ -267,6 +297,11 @@ case class IndexedBroadcastEquiJoinExec(left: SparkPlan, right: SparkPlan, leftC
   private val logger = LoggerFactory.getLogger(classOf[IndexedBroadcastEquiJoinExec])
 
   override def output: Seq[Attribute] = left.output ++ right.output
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[SparkPlan]
+  ): IndexedBroadcastEquiJoinExec =
+    copy(left = newChildren(0), right = newChildren(1))
 
   override def doExecute(): RDD[InternalRow] = {
     logger.debug("in the Broadcast JOIN operator")

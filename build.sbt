@@ -1,20 +1,20 @@
 name := "IndexedDF"
 
-version := "1.0"
+version := "2.0"
 
-scalaVersion := "2.11.8"
+scalaVersion := "2.13.16"
 
-libraryDependencies += "org.apache.spark" % "spark-core_2.11" % "2.3.1"
-libraryDependencies += "org.apache.spark" % "spark-sql_2.11" % "2.3.1"
-libraryDependencies += "org.apache.spark" % "spark-catalyst_2.11" % "2.3.1"
-libraryDependencies += "org.scalatest" %% "scalatest" % "2.2.6" % "test"
+val sparkVersion = "4.0.0"
 
-libraryDependencies += "com.typesafe.scala-logging" %% "scala-logging-api" % "2.1.2"
-libraryDependencies += "com.typesafe.scala-logging" %% "scala-logging-slf4j" % "2.1.2"
-libraryDependencies += "org.slf4j" % "slf4j-api" % "1.7.5"
+libraryDependencies ++= Seq(
+  "org.apache.spark" %% "spark-core" % sparkVersion % Provided,
+  "org.apache.spark" %% "spark-sql" % sparkVersion % Provided,
+  "org.apache.spark" %% "spark-catalyst" % sparkVersion % Provided,
+  "org.scalatest" %% "scalatest" % "3.2.19" % Test,
+  "com.typesafe.scala-logging" %% "scala-logging" % "3.9.5",
+  "org.slf4j" % "slf4j-api" % "2.0.16"
+)
 
-
-
-fork in Test := true
+Test / fork := true
 
 

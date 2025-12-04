@@ -282,8 +282,8 @@ object BenchmarkPrograms {
 
     import sparkSession.implicits._
 
-    sparkSession.experimental.extraStrategies = (Seq(IndexedOperators) ++ sparkSession.experimental.extraStrategies)
-    sparkSession.experimental.extraOptimizations = (Seq(ConvertToIndexedOperators) ++ sparkSession.experimental.extraOptimizations)
+    sparkSession.experimental.extraStrategies ++= Seq(IndexedOperators)
+    sparkSession.experimental.extraOptimizations ++= Seq(ConvertToIndexedOperators)
 
     val edgeSchema = StructType(Array(
       StructField("src", LongType, false),

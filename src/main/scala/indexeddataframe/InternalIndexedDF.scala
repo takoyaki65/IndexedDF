@@ -235,10 +235,9 @@ class InternalIndexedDF {
     private val currentRow = new UnsafeRow(schema.size)
     private var crntRowPointer = rowPointer
 
-    override val size = nRows
-    override val length = nRows
+    override def knownSize: Int = nRows
 
-    def hasNext(): Boolean = {
+    def hasNext: Boolean = {
       var ret = false
       if (crntRowPointer != 0xffffffffffffffffL) {
         ret = true
@@ -289,13 +288,12 @@ class InternalIndexedDF {
     * implementation of the iterator imposed by the RDD interface
     */
   class PartitionIterator() extends Iterator[InternalRow] {
-    override val size = nRows
-    override val length = nRows
+    override def knownSize: Int = nRows
     // the keys of the
     var keys:Iterator[Long] = null
     var crntKey:Long = 0L
     var crntRowIterator:Iterator[InternalRow] = null
-    def hasNext(): Boolean = {
+    def hasNext: Boolean = {
       var result = false
       if (keys == null) {
         // this is the first time we instantiate the iterator
