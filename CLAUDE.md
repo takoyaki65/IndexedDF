@@ -6,11 +6,20 @@ Apache Spark DataFrameにインデックス機能を追加する拡張ライブ�
 
 Spark SQLのDataFrameに対してハッシュインデックスを作成し、キールックアップやインデックスを活用したEqui-Joinを高速化する。CTrie（Concurrent Trie）を使用してスレッドセーフなインデックス構造を実現。
 
-## ビルド・テスト
+## ビルド・テスト・実行
 
 ```bash
 sbt compile    # コンパイル
 sbt test       # テスト実行
+
+# デモ実行（インメモリデータ）
+sbt "runMain indexeddataframe.Example"
+
+# ベンチマーク実行（インメモリデータ）
+sbt "runMain indexeddataframe.BenchmarkPrograms"
+
+# ベンチマーク実行（外部CSVファイル）
+sbt "runMain indexeddataframe.BenchmarkPrograms <delimiter1> <path1> <delimiter2> <path2> <partitions> <master>"
 ```
 
 ## 依存関係

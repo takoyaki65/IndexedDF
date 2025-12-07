@@ -18,10 +18,8 @@ object Utils {
   def defaultNoPartitions: Int = 16
   val defaultPartitioner: HashPartitioner = new HashPartitioner(defaultNoPartitions)
 
-  /**
-    * function that is executed when the index is created on a DataFrame
-    * this function is called for each partition of the original DataFrame and it creates an [[InternalIndexedDF]]
-    * that contains the rows of the partitions and a CTrie for storing an index
+  /** function that is executed when the index is created on a DataFrame this function is called for each partition of the original DataFrame and it
+    * creates an [[InternalIndexedDF]] that contains the rows of the partitions and a CTrie for storing an index
     * @param colNo
     * @param rows
     * @param types
@@ -44,7 +42,7 @@ object Utils {
     logger.info("nBatches = " + (idf.nRowBatches * 8 / MB))
     logger.info("data = " + idf.dataSize / MB)
     logger.info("==========================")
-    */
+     */
     /*
     val iter = idf.get(32985348972561L)
     var nRows = 0
@@ -53,19 +51,18 @@ object Utils {
       iter.next()
     }
     println("this item is repeated %d times on this partition".format(nRows))
-    */
+     */
     idf
   }
 
-  /**
-    * function that ensures an RDD is cached
+  /** function that ensures an RDD is cached
     * @param rdd
     * @param storageLevel
     * @tparam T
     * @return
     */
   def ensureCached[T](rdd: IRDD, storageLevel: StorageLevel = StorageLevel.MEMORY_ONLY): IRDD = {
-    //println(rdd.getStorageLevel + " --------- " + storageLevel)
+    // println(rdd.getStorageLevel + " --------- " + storageLevel)
     if (rdd.getStorageLevel == StorageLevel.NONE) {
       rdd.persist(storageLevel)
     } else {
@@ -86,14 +83,13 @@ object Utils {
   }
 }
 
-/**
-  * a custom RDD class that is composed of a number of partitions containing the rows of the
-  * indexed dataframe; each of these partitions is represented as an [[InternalIndexedDF]]
+/** a custom RDD class that is composed of a number of partitions containing the rows of the indexed dataframe; each of these partitions is
+  * represented as an [[InternalIndexedDF]]
   * @param colNo
   * @param partitionsRDD
   */
 class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedDF])
-  extends RDD[InternalRow](partitionsRDD.context, List(new OneToOneDependency(partitionsRDD))) {
+    extends RDD[InternalRow](partitionsRDD.context, List(new OneToOneDependency(partitionsRDD))) {
 
   override val partitioner = partitionsRDD.partitioner
 
@@ -108,51 +104,58 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedDF])
     this
   }
 
-  /**
-    * RDD function that returns an RDD of the rows containing the search key
+  /** RDD function that returns an RDD of the rows containing the search key
     * @param key
     * @return
     */
   def get(key: AnyVal): RDD[InternalRow] = {
-    //println("I have this many partitions: " + partitionsRDD.getNumPartitions)
+    // println("I have this many partitions: " + partitionsRDD.getNumPartitions)
     val res = partitionsRDD.flatMap { part =>
-      part.get(key).map( row => row.copy() )
+      part.get(key).map(row => row.copy())
     }
     res
   }
 
-  /**
-    * RDD method that returns an RDD of rows containing the searched keys
+  /** RDD method that returns an RDD of rows containing the searched keys
     * @param keys
     * @return
     */
   def multiget(keys: Array[AnyVal]): RDD[InternalRow] = {
-    //println("I have this many partitions: " + partitionsRDD.getNumPartitions)
-    val res = partitionsRDD.mapPartitions[InternalRow](
-      part => part.next().multiget(keys), true)
+    // println("I have this many partitions: " + partitionsRDD.getNumPartitions)
+    val res = partitionsRDD.mapPartitions[InternalRow](part => part.next().multiget(keys), true)
     res
 
   }
 
-  /**
-    * multiget method used in the broadcast join
+  /** multiget method used in the broadcast join
     * @param rightRDD
     * @param leftSchema
     * @param rightSchema
     * @param joinRightCol
     * @return
     */
-  def multigetBroadcast(rightRDD: Broadcast[Array[InternalRow]],
-                        leftSchema: StructType,
-                        rightSchema: StructType,
-                        rightOutput: Seq[Attribute],
-                        joinRightCol: Int): RDD[InternalRow] = {
+  def multigetBroadcast(
+      rightRDD: Broadcast[Array[InternalRow]],
+      leftSchema: StructType,
+      rightSchema: StructType,
+      rightOutput: Seq[Attribute],
+      joinRightCol: Int
+  ): RDD[InternalRow] = {
     val res = partitionsRDD.mapPartitions[InternalRow](
       part => {
         val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
-        val res = part.next().multigetJoinedRight(rightRDD.value.toIterator, joiner, rightOutput, joinRightCol)
+        val res = part
+          .next()
+          .multigetJoinedRight(
+            rightRDD.value.toIterator,
+            joiner,
+            rightOutput,
+            joinRightCol
+          )
         res
-      }, true)
+      },
+      true
+    )
     res
   }
 }

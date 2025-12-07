@@ -17,4 +17,6 @@ libraryDependencies ++= Seq(
 
 Test / fork := true
 
-
+// runMainでProvidedスコープの依存を含める
+Compile / run := Defaults.runTask(Compile / fullClasspath, Compile / run / mainClass, Compile / run / runner).evaluated
+Compile / runMain := Defaults.runMainTask(Compile / fullClasspath, Compile / run / runner).evaluated
