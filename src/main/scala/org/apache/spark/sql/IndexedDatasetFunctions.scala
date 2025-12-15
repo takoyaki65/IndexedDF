@@ -14,6 +14,10 @@ class IndexedDatasetFunctions[T](ds: Dataset[T]) extends Serializable with Class
   def createIndex(colNo: Int): DataFrame = {
     ClassicDataset.ofRows(classicDs.sparkSession, CreateIndex(colNo, classicDs.logicalPlan))
   }
+  def createIndex(colName: String): DataFrame = {
+    val colNo = classicDs.schema.fieldIndex(colName)
+    createIndex(colNo)
+  }
   def appendRows(rightDS: Dataset[T]): DataFrame = {
     val rightClassicDs = rightDS.asInstanceOf[ClassicDataset[T]]
     ClassicDataset.ofRows(classicDs.sparkSession, AppendRows(classicDs.logicalPlan, rightClassicDs.logicalPlan))
