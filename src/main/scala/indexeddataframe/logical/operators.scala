@@ -34,29 +34,26 @@ case class GetRows(val key: AnyVal, child: LogicalPlan) extends UnaryNode with I
 }
 
 trait IndexedOperator extends LogicalPlan {
-  /**
-    * Every indexed operator relies on its input having a specific set of columns, so we override
-    * references to include all inputs to prevent Catalyst from dropping any input columns.
+
+  /** Every indexed operator relies on its input having a specific set of columns, so we override references to include all inputs to prevent Catalyst
+    * from dropping any input columns.
     */
   override def references: AttributeSet = inputSet
 
   def isIndexed: Boolean = children.exists(_.find {
     case p: IndexedOperator => p.isIndexed
-    case _ => false
+    case _                  => false
   }.nonEmpty)
 
 }
 
-case class IndexedLocalRelation(output: Seq[Attribute], data: Seq[InternalRow])
-  extends LeafNode with MultiInstanceRelation with IndexedOperator {
+case class IndexedLocalRelation(output: Seq[Attribute], data: Seq[InternalRow]) extends LeafNode with MultiInstanceRelation with IndexedOperator {
 
   // A local relation must have resolved output.
   require(output.forall(_.resolved), "Unresolved attributes found when constructing LocalRelation.")
 
-  /**
-    * Returns an identical copy of this relation with new exprIds for all attributes.  Different
-    * attributes are required when a relation is going to be included multiple times in the same
-    * query.
+  /** Returns an identical copy of this relation with new exprIds for all attributes. Different attributes are required when a relation is going to be
+    * included multiple times in the same query.
     */
   override final def newInstance(): this.type = {
     IndexedLocalRelation(output.map(_.newInstance()), data).asInstanceOf[this.type]
@@ -71,10 +68,7 @@ case class IndexedLocalRelation(output: Seq[Attribute], data: Seq[InternalRow])
 //  }
 }
 
-case class IndexedBlockRDD(
-      output: Seq[Attribute],
-      rdd: IRDD, child: SparkPlan)
-  extends IndexedOperator with MultiInstanceRelation {
+case class IndexedBlockRDD(output: Seq[Attribute], rdd: IRDD, child: SparkPlan) extends IndexedOperator with MultiInstanceRelation {
 
   override def children: Seq[LogicalPlan] = Nil
 
@@ -86,7 +80,7 @@ case class IndexedBlockRDD(
     case IndexedBlockRDD(_, otherRDD, child) => rdd.id == otherRDD.id
     case _ => false
   }
-  */
+   */
 
   override def producedAttributes: AttributeSet = outputSet
 
@@ -94,7 +88,7 @@ case class IndexedBlockRDD(
       newChildren: IndexedSeq[LogicalPlan]
   ): IndexedBlockRDD = this
 
-/*
+  /*
   override lazy val statistics: Statistics = {
     val batchStats: LongAccumulator = child.sqlContext.sparkContext.longAccumulator
     /*if (batchStats.value == 0L) {
@@ -104,14 +98,12 @@ case class IndexedBlockRDD(
     }*/
     Statistics(0)
   }
- */
+   */
 }
 
-case class IndexedJoin(left: LogicalPlan,
-                          right: LogicalPlan,
-                          joinType: JoinType,
-                          condition: Option[Expression])
-  extends BinaryNode with IndexedOperator {
+case class IndexedJoin(left: LogicalPlan, right: LogicalPlan, joinType: JoinType, condition: Option[Expression])
+    extends BinaryNode
+    with IndexedOperator {
 
   override def output: Seq[Attribute] = left.output ++ right.output
   override protected def withNewChildrenInternal(
@@ -121,7 +113,7 @@ case class IndexedJoin(left: LogicalPlan,
     copy(left = newLeft, right = newRight)
 }
 
-case class IndexedFilter(condition: Expression, child:IndexedOperator) extends UnaryNode with IndexedOperator {
+case class IndexedFilter(condition: Expression, child: IndexedOperator) extends UnaryNode with IndexedOperator {
   override def output: Seq[Attribute] = child.output
   override protected def withNewChildInternal(
       newChild: LogicalPlan

@@ -35,17 +35,12 @@ abstract class CustomUnsafeRowJoiner {
   def join(row1: UnsafeRow, row2: UnsafeRow, buf: Long): UnsafeRow
 }
 
-
-/**
-  * A code generator for concatenating two [[UnsafeRow]]s into a single [[UnsafeRow]].
+/** A code generator for concatenating two [[UnsafeRow]]s into a single [[UnsafeRow]].
   *
   * The high level algorithm is:
   *
-  * 1. Concatenate the two bitsets together into a single one, taking padding into account.
-  * 2. Move fixed-length data.
-  * 3. Move variable-length data.
-  * 4. Update the offset position (i.e. the upper 32 bits in the fixed length part) for all
-  *    variable-length data.
+  *   1. Concatenate the two bitsets together into a single one, taking padding into account. 2. Move fixed-length data. 3. Move variable-length data.
+  *      4. Update the offset position (i.e. the upper 32 bits in the fixed length part) for all variable-length data.
   */
 object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructType), CustomUnsafeRowJoiner] {
 
@@ -55,14 +50,13 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
 
   override protected def canonicalize(in: (StructType, StructType)): (StructType, StructType) = in
 
-  override protected def bind(in: (StructType, StructType), inputSchema: Seq[Attribute])
-  : (StructType, StructType) = {
+  override protected def bind(in: (StructType, StructType), inputSchema: Seq[Attribute]): (StructType, StructType) = {
     in
   }
 
   def create(schema1: StructType, schema2: StructType): CustomUnsafeRowJoiner = {
     val ctx = new CodegenContext
-    val offset = 0//Platform.BYTE_ARRAY_OFFSET
+    val offset = 0 // Platform.BYTE_ARRAY_OFFSET
     val getLong = "Platform.getLong"
     val putLong = "Platform.putLong"
 
@@ -106,7 +100,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
       expressions = copyBitset,
       funcName = "copyBitsetFunc",
       arguments = ("java.lang.Object", "obj1") :: ("long", "offset1") ::
-        ("java.lang.Object", "obj2") :: ("long", "offset2") :: Nil)
+        ("java.lang.Object", "obj2") :: ("long", "offset2") :: Nil
+    )
 
     // --------------------- copy fixed length portion from row 1 ----------------------- //
     var cursor = offset + outputBitsetWords * 8
@@ -163,11 +158,11 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
         // case of a null field, in which case the offset should be zero and should not have a
         // shift added to it.
         val shift =
-        if (i < schema1.size) {
-          s"${(outputBitsetWords - bitset1Words + schema2.size) * 8}L"
-        } else {
-          s"(${(outputBitsetWords - bitset2Words + schema1.size) * 8}L + numBytesVariableRow1)"
-        }
+          if (i < schema1.size) {
+            s"${(outputBitsetWords - bitset1Words + schema2.size) * 8}L"
+          } else {
+            s"(${(outputBitsetWords - bitset2Words + schema1.size) * 8}L + numBytesVariableRow1)"
+          }
         val cursor = offset + outputBitsetWords * 8 + i * 8
         // UnsafeRow is a little underspecified, so in what follows we'll treat UnsafeRowWriter's
         // output as a de-facto specification for the internal layout of data.
@@ -217,7 +212,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
       expressions = updateOffset,
       funcName = "copyBitsetFunc",
       arguments = ("long", "numBytesVariableRow1") :: Nil,
-      makeSplitFunction = (s: String) => "long existingOffset;\n" + s)
+      makeSplitFunction = (s: String) => "long existingOffset;\n" + s
+    )
 
     // ------------------------ Finally, put everything together  --------------------------- //
     val codeBody = s"""

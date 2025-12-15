@@ -6,9 +6,7 @@ import indexeddataframe.implicits._
 import indexeddataframe.logical.ConvertToIndexedOperators
 import org.apache.spark.sql.types._
 
-/**
-  * IndexedDFのデモプログラム
-  * 実行: sbt "runMain indexeddataframe.Example"
+/** IndexedDFのデモプログラム 実行: sbt "runMain indexeddataframe.Example"
   */
 object Example {
 
@@ -70,8 +68,7 @@ object Example {
     // 4. Join (インデックス活用)
     println("--- 4. Indexed Join ---")
     nodesDF.createOrReplaceTempView("nodes")
-    val joinResult = sparkSession.sql(
-      """SELECT e.src, e.dst, e.label, n.name
+    val joinResult = sparkSession.sql("""SELECT e.src, e.dst, e.label, n.name
         |FROM indexed_edges e
         |JOIN nodes n ON e.src = n.id
         |""".stripMargin)
@@ -99,14 +96,11 @@ object Example {
   }
 }
 
-/**
-  * ベンチマークプログラム
+/** ベンチマークプログラム
   *
-  * 外部CSVファイルを使用する場合:
-  *   sbt "runMain indexeddataframe.BenchmarkPrograms <delimiter1> <path1> <delimiter2> <path2> <partitions> <master>"
+  * 外部CSVファイルを使用する場合: sbt "runMain indexeddataframe.BenchmarkPrograms <delimiter1> <path1> <delimiter2> <path2> <partitions> <master>"
   *
-  * インメモリデータでデモ実行する場合:
-  *   sbt "runMain indexeddataframe.BenchmarkPrograms"
+  * インメモリデータでデモ実行する場合: sbt "runMain indexeddataframe.BenchmarkPrograms"
   */
 object BenchmarkPrograms {
 
@@ -140,10 +134,12 @@ object BenchmarkPrograms {
     indexedDF.createOrReplaceTempView("edges")
     nodesDF.createOrReplaceTempView("vertices")
 
-    val res = sparkSession.sql("SELECT * " +
-      "FROM edges " +
-      "JOIN vertices " +
-      "ON edges.src = vertices.id")
+    val res = sparkSession.sql(
+      "SELECT * " +
+        "FROM edges " +
+        "JOIN vertices " +
+        "ON edges.src = vertices.id"
+    )
 
     res.explain(true)
 
@@ -267,10 +263,12 @@ object BenchmarkPrograms {
       indexedDFRes.createOrReplaceTempView("edges")
       nodesDF.createOrReplaceTempView("vertices")
 
-      res = sparkSession.sql("SELECT * " +
-        "FROM edges " +
-        "JOIN vertices " +
-        "ON edges.src = vertices.id")
+      res = sparkSession.sql(
+        "SELECT * " +
+          "FROM edges " +
+          "JOIN vertices " +
+          "ON edges.src = vertices.id"
+      )
       triggerExecutionDF(res)
 
       if (i % 5 == 0) indexedDFRes = indexedDFRes.appendRows(appendDF).cache()
@@ -285,7 +283,7 @@ object BenchmarkPrograms {
   }
 
   def getSizeInBytes(df: DataFrame): Unit = {
-    //df.queryExecution.optimizedPlan.statistics.sizeInBytes
+    // df.queryExecution.optimizedPlan.statistics.sizeInBytes
   }
 
   def main(args: Array[String]): Unit = {
@@ -318,19 +316,25 @@ object BenchmarkPrograms {
     sparkSession.experimental.extraStrategies ++= Seq(IndexedOperators)
     sparkSession.experimental.extraOptimizations ++= Seq(ConvertToIndexedOperators)
 
-    val edgeSchema = StructType(Array(
-      StructField("src", LongType, nullable = false),
-      StructField("dst", LongType, nullable = false),
-      StructField("cost", FloatType, nullable = true)))
-    val nodeSchema = StructType(Array(
-      StructField("id", LongType, nullable = false),
-      StructField("firstName", StringType, nullable = true),
-      StructField("lastName", StringType, nullable = true),
-      StructField("gender", StringType, nullable = true),
-      StructField("birthday", DateType, nullable = true),
-      StructField("creationDate", StringType, nullable = true),
-      StructField("locationIP", StringType, nullable = true),
-      StructField("browserUsed", StringType, nullable = true)))
+    val edgeSchema = StructType(
+      Array(
+        StructField("src", LongType, nullable = false),
+        StructField("dst", LongType, nullable = false),
+        StructField("cost", FloatType, nullable = true)
+      )
+    )
+    val nodeSchema = StructType(
+      Array(
+        StructField("id", LongType, nullable = false),
+        StructField("firstName", StringType, nullable = true),
+        StructField("lastName", StringType, nullable = true),
+        StructField("gender", StringType, nullable = true),
+        StructField("birthday", DateType, nullable = true),
+        StructField("creationDate", StringType, nullable = true),
+        StructField("locationIP", StringType, nullable = true),
+        StructField("browserUsed", StringType, nullable = true)
+      )
+    )
 
     var edgesDF = sparkSession.read
       .option("header", "true")
@@ -365,8 +369,7 @@ object BenchmarkPrograms {
     sparkSession.stop()
   }
 
-  /**
-    * インメモリデータでベンチマーク実行（外部ファイル不要）
+  /** インメモリデータでベンチマーク実行（外部ファイル不要）
     */
   def runWithSampleData(): Unit = {
     println("Running with in-memory sample data...")

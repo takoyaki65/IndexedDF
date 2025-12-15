@@ -1,6 +1,5 @@
 package indexeddataframe
 
-
 import org.apache.spark.sql.{Dataset, IndexedDatasetFunctions}
 
 object implicits {

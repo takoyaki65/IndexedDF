@@ -5,7 +5,6 @@ import org.scalatest.funsuite.AnyFunSuite
 import indexeddataframe.implicits._
 import indexeddataframe.logical.ConvertToIndexedOperators
 
-
 class IndexedDFTest extends AnyFunSuite {
 
   val sparkSession = SparkSession.builder
@@ -21,7 +20,7 @@ class IndexedDFTest extends AnyFunSuite {
 
   test("createIndex") {
 
-    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag").cache()
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
 
     val idf = df.createIndex(0)
 
@@ -30,7 +29,7 @@ class IndexedDFTest extends AnyFunSuite {
 
   test("getRows") {
 
-    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag").cache()
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
 
     val idf = df.createIndex(0)
 
@@ -42,7 +41,7 @@ class IndexedDFTest extends AnyFunSuite {
 
   test("filter") {
 
-    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag").cache()
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
     val idf = df.createIndex(0)
     idf.createOrReplaceTempView("idf")
 
@@ -54,15 +53,15 @@ class IndexedDFTest extends AnyFunSuite {
 
   test("appendRows") {
 
-    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag").cache()
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
     val df2 = Seq((1234, 7546, "a")).toDF("src", "dst", "tag")
 
     val idf = df.createIndex(0).cache()
     val idf2 = idf.appendRows(df2)
     val idf3 = idf2.appendRows(df2)
 
-    //idf2.explain()
-    //idf3.explain()
+    // idf2.explain()
+    // idf3.explain()
 
     val rows = idf.getRows(1234)
     val rows2 = idf2.getRows(1234)
@@ -78,7 +77,7 @@ class IndexedDFTest extends AnyFunSuite {
 
   test("join") {
 
-    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag")
+    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag")
     val df2 = Seq((1234, "test")).toDF("src", "data")
 
     val myIDF = myDf.createIndex(0).cache()
@@ -104,7 +103,7 @@ class IndexedDFTest extends AnyFunSuite {
     val df2 = Seq((1234, "test")).toDF("src", "data")
 
     val myIDF = myDf.createIndex(1).cache()
-    //val myIDF = myDf.cache()
+    // val myIDF = myDf.cache()
 
     myIDF.createOrReplaceTempView("indextable")
     df2.createOrReplaceTempView("nonindextable")
@@ -147,9 +146,9 @@ class IndexedDFTest extends AnyFunSuite {
     assert(result.collect().length == 2)
   }
 
-  test ("divergence") {
+  test("divergence") {
 
-    val d1 = Seq((1230, 12345, "sdsad"), (1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef") ).toDF("src", "dst", "tag").cache()
+    val d1 = Seq((1230, 12345, "sdsad"), (1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
     val d2 = Seq((1235, 7546, "a")).toDF("src", "dst", "tag")
     val d3 = Seq((1236, 7546, "a")).toDF("src", "dst", "tag")
 
@@ -157,16 +156,16 @@ class IndexedDFTest extends AnyFunSuite {
     val table2 = table1.appendRows(d2)
     val table3 = table1.appendRows(d3)
 
-    //idf2.explain()
-    //idf3.explain()
+    // idf2.explain()
+    // idf3.explain()
 
-    //val rows = table1.getRows(1234)
+    // val rows = table1.getRows(1234)
     val rows2 = table2.getRows(1236)
     val rows3 = table3.getRows(1235)
 
     val r3 = rows3.collect()
     val r2 = rows2.collect()
-    //val r1 = rows.collect()
+    // val r1 = rows.collect()
 
     // check if the older dataframe does not see the update
     assert(r2.length == 0 && r3.length == 0)

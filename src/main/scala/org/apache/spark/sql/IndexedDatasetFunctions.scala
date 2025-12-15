@@ -3,10 +3,8 @@ package org.apache.spark.sql
 import indexeddataframe.logical.{AppendRows, CreateIndex, GetRows}
 import org.apache.spark.sql.classic.{ClassicConversions, Dataset => ClassicDataset}
 
-/**
-  * we add 3 new "indexed" methods to the dataset class
-  * with these, users can create indexes, append rows and get rows based on key
-  * also indexed equi joins are supported if the left side of the join is an indexed relation
+/** we add 3 new "indexed" methods to the dataset class with these, users can create indexes, append rows and get rows based on key also indexed equi
+  * joins are supported if the left side of the join is an indexed relation
   * @param ds
   * @tparam T
   */
