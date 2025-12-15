@@ -19,7 +19,8 @@ object IndexedOperators extends SparkStrategy {
       * capabilities; therefore, we just insert a dummy strategy that returns an operator which works on "indexed RDDs"
       */
     case IndexedBlockRDD(output, rdd, child: IndexedOperatorExec) =>
-      IndexedBlockRDDScanExec(output, rdd, child.asInstanceOf[IndexedOperatorExec]) :: Nil
+      val indexedChild = child.asInstanceOf[IndexedOperatorExec]
+      IndexedBlockRDDScanExec(output, rdd, indexedChild.indexColNo, rdd.partitionsRDD.getNumPartitions) :: Nil
 
     case GetRows(key, child) => GetRowsExec(key, planLater(child)) :: Nil
     /** dummy filter object for the moment; in the future, we will implement filtering functionality on the indexed data

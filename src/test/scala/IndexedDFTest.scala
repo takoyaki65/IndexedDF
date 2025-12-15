@@ -7,7 +7,8 @@ import indexeddataframe.logical.ConvertToIndexedOperators
 
 class IndexedDFTest extends AnyFunSuite {
 
-  val sparkSession = SparkSession.builder
+  val sparkSession = SparkSession
+    .builder()
     .master("local")
     .appName("spark test app")
     .config("spark.sql.shuffle.partitions", "3")
@@ -27,11 +28,32 @@ class IndexedDFTest extends AnyFunSuite {
     assert(idf.collect().length == df.collect().length)
   }
 
+  test("createIndex(by name)") {
+
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
+
+    val idf = df.createIndex("src")
+
+    assert(idf.collect().length == df.collect().length)
+  }
+
   test("getRows") {
 
     val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
 
     val idf = df.createIndex(0)
+
+    val rows = idf.getRows(1234)
+    rows.show()
+
+    assert(rows.collect().length == 2)
+  }
+
+  test("getRows (by name)") {
+
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
+
+    val idf = df.createIndex("src")
 
     val rows = idf.getRows(1234)
     rows.show()
@@ -51,6 +73,18 @@ class IndexedDFTest extends AnyFunSuite {
     assert(rows.collect().length == 2)
   }
 
+  test("filter (by name)") {
+
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
+    val idf = df.createIndex("src")
+    idf.createOrReplaceTempView("idf_byname")
+
+    val rows = sparkSession.sql("SELECT * FROM idf_byname WHERE src = 1234")
+    rows.show()
+
+    assert(rows.collect().length == 2)
+  }
+
   test("appendRows") {
 
     val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
@@ -60,8 +94,32 @@ class IndexedDFTest extends AnyFunSuite {
     val idf2 = idf.appendRows(df2)
     val idf3 = idf2.appendRows(df2)
 
-    // idf2.explain()
-    // idf3.explain()
+    idf2.explain()
+    idf3.explain()
+
+    val rows = idf.getRows(1234)
+    val rows2 = idf2.getRows(1234)
+    val rows3 = idf3.getRows(1234)
+
+    val r3 = rows3.collect()
+    val r2 = rows2.collect()
+    val r1 = rows.collect()
+
+    // check if the older dataframe does not see the update
+    assert(r1.length == 2 && r2.length == 3 && r3.length == 4)
+  }
+
+  test("appendRows (by name)") {
+
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
+    val df2 = Seq((1234, 7546, "a")).toDF("src", "dst", "tag")
+
+    val idf = df.createIndex("src").cache()
+    val idf2 = idf.appendRows(df2)
+    val idf3 = idf2.appendRows(df2)
+
+    idf2.explain()
+    idf3.explain()
 
     val rows = idf.getRows(1234)
     val rows2 = idf2.getRows(1234)
@@ -93,13 +151,27 @@ class IndexedDFTest extends AnyFunSuite {
     assert(joinedDF.collect().length == 2)
   }
 
+  test("join (by name)") {
+
+    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag")
+    val df2 = Seq((1234, "test")).toDF("src", "data")
+
+    val myIDF = myDf.createIndex("src").cache()
+
+    myIDF.createOrReplaceTempView("indextable_byname")
+    df2.createOrReplaceTempView("nonindextable_byname")
+
+    val joinedDF = sparkSession.sql("select * from indextable_byname join nonindextable_byname on indextable_byname.src = nonindextable_byname.src")
+
+    joinedDF.explain(true)
+
+    joinedDF.show()
+    assert(joinedDF.collect().length == 2)
+  }
+
   test("join2") {
 
-    val myDf = Seq(
-      (1234, 12345, "abcd"),
-      (1234, 102, "abcde"),
-      (1237, 120, "abcdef")
-    ).toDF("src", "dst", "tag")
+    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag")
     val df2 = Seq((1234, "test")).toDF("src", "data")
 
     val myIDF = myDf.createIndex(1).cache()
@@ -110,6 +182,27 @@ class IndexedDFTest extends AnyFunSuite {
 
     // Join on non indexed column. Should fallback to normal non-indexed joins.
     val joinedDF = sparkSession.sql("select * from indextable join nonindextable on indextable.src = nonindextable.src")
+
+    joinedDF.explain(true)
+
+    joinedDF.show()
+    assert(joinedDF.collect().length == 2)
+  }
+
+  test("join2 (by name)") {
+
+    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag")
+    val df2 = Seq((1234, "test")).toDF("src", "data")
+
+    val myIDF = myDf.createIndex("dst").cache()
+    // val myIDF = myDf.cache()
+
+    myIDF.createOrReplaceTempView("indextable2_byname")
+    df2.createOrReplaceTempView("nonindextable2_byname")
+
+    // Join on non indexed column. Should fallback to normal non-indexed joins.
+    val joinedDF =
+      sparkSession.sql("select * from indextable2_byname join nonindextable2_byname on indextable2_byname.src = nonindextable2_byname.src")
 
     joinedDF.explain(true)
 
@@ -140,6 +233,17 @@ class IndexedDFTest extends AnyFunSuite {
     val df = Seq(("abcd")).toDF("tag")
 
     val myIDF = myDf.createIndex(2).cache()
+
+    val result = myIDF.getRows("abcde".asInstanceOf[AnyVal])
+
+    assert(result.collect().length == 2)
+  }
+
+  test("string index (by name)") {
+    val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef"), (1, -3, "abcde")).toDF("src", "dst", "tag")
+    val df = Seq(("abcd")).toDF("tag")
+
+    val myIDF = myDf.createIndex("tag").cache()
 
     val result = myIDF.getRows("abcde".asInstanceOf[AnyVal])
 

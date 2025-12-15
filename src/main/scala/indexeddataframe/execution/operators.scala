@@ -39,6 +39,25 @@ trait IndexedOperatorExec extends SparkPlan {
   // the number of the indexed column
   def indexColNo = 0
 
+  // helper method to find the IndexedOperatorExec in the plan tree
+  // This is used to find the indexed operator when spark inserts additional operators in the plan tree
+  // like ShuffleExchangeExec, etc.
+  protected def findIndexedOperator(plan: SparkPlan): IndexedOperatorExec = {
+    plan match {
+      case indexed: IndexedOperatorExec => indexed
+      case other if other.children.nonEmpty =>
+        other.children
+          .flatMap(child =>
+            try Some(findIndexedOperator(child))
+            catch { case _: IllegalStateException => None }
+          )
+          .headOption
+          .getOrElse(throw new IllegalStateException(s"IndexedOperatorExec not found in plan tree: $plan"))
+      case _ =>
+        throw new IllegalStateException(s"IndexedOperatorExec not found in plan tree: $plan")
+    }
+  }
+
   /** if the indexed operator is required to return rows (i.e., as for a regular spark DF operations) produce its rows by scanning the index
     */
   override def doExecute() = {
@@ -110,8 +129,11 @@ case class AppendRowsExec(left: SparkPlan, right: SparkPlan) extends BinaryExecN
 
   override def output: Seq[Attribute] = left.output
 
-  override def indexColNo = left.asInstanceOf[IndexedOperatorExec].indexColNo
-  def distributionOutput = left.asInstanceOf[IndexedOperatorExec].indexColNo
+  // find the indexed operator in the left plan in case spark has added additional operators like ShuffleExchangeExec, etc.
+  private lazy val leftIndexedOp: IndexedOperatorExec = findIndexedOperator(left)
+
+  override def indexColNo = leftIndexedOp.indexColNo
+  def distributionOutput = leftIndexedOp.indexColNo
 
   override def outputPartitioning = left.outputPartitioning
   override def requiredChildDistribution: Seq[Distribution] =
@@ -124,7 +146,7 @@ case class AppendRowsExec(left: SparkPlan, right: SparkPlan) extends BinaryExecN
 
   override def executeIndexed(): IRDD = {
     logger.debug("executing the appendRows operator")
-    val leftRDD = left.asInstanceOf[IndexedOperatorExec].executeIndexed()
+    val leftRDD = findIndexedOperator(left).executeIndexed()
     val rightRDD = right.execute()
 
     val zippedResult = leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
@@ -144,11 +166,14 @@ case class AppendRowsExec(left: SparkPlan, right: SparkPlan) extends BinaryExecN
   * @param rdd
   * @param child
   */
-case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, child: SparkPlan) extends LeafExecNode with IndexedOperatorExec {
+case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, override val indexColNo: Int, numPartitions: Int)
+    extends LeafExecNode
+    with IndexedOperatorExec {
   private val logger = LoggerFactory.getLogger(classOf[IndexedBlockRDDScanExec])
 
-  override def indexColNo = child.asInstanceOf[IndexedOperatorExec].indexColNo
-  override def outputPartitioning: Partitioning = child.outputPartitioning
+  // Declare the output partitioning as hash partitioned on the index column
+  // Tell spark not to shuffle after this operator
+  override def outputPartitioning: Partitioning = HashPartitioning(Seq(output(indexColNo)), numPartitions)
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[SparkPlan]
@@ -244,15 +269,31 @@ case class IndexedShuffledEquiJoinExec(
   ): IndexedShuffledEquiJoinExec =
     copy(left = newChildren(0), right = newChildren(1))
 
+  // helper method to find the IndexedOperatorExec in the plan tree
+  // This is used to find the indexed operator when spark inserts additional operators in the plan tree
+  // like ShuffleExchangeExec, etc.
+  private def findIndexedOp(plan: SparkPlan): Option[IndexedOperatorExec] = {
+    plan match {
+      case indexed: IndexedOperatorExec => Some(indexed)
+      case other if other.children.nonEmpty =>
+        other.children.flatMap(findIndexedOp).headOption
+      case _ => None
+    }
+  }
+
   override def doExecute(): RDD[InternalRow] = {
     logger.debug("in the Shuffled JOIN operator")
 
     val leftSchema = StructType(left.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
     val rightSchema = StructType(right.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
 
-    left match {
-      case _: IndexedOperatorExec => {
-        val leftRDD = left.asInstanceOf[IndexedOperatorExec].executeIndexed()
+    // check which side is indexed
+    val leftIndexedOp = findIndexedOp(left)
+    val rightIndexedOp = findIndexedOp(right)
+
+    (leftIndexedOp, rightIndexedOp) match {
+      case (Some(indexedLeft), _) => {
+        val leftRDD = indexedLeft.executeIndexed()
         val rightRDD = right.execute()
 
         val result = leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
@@ -266,9 +307,9 @@ case class IndexedShuffledEquiJoinExec(
         }
         result
       }
-      case _ => {
+      case (_, Some(indexedRight)) => {
         val leftRDD = left.execute()
-        val rightRDD = right.asInstanceOf[IndexedOperatorExec].executeIndexed()
+        val rightRDD = indexedRight.executeIndexed()
 
         val result = rightRDD.partitionsRDD.zipPartitions(leftRDD, true) { (rightIter, leftIter) =>
           // generate an unsafe row joiner
@@ -281,6 +322,10 @@ case class IndexedShuffledEquiJoinExec(
         }
         result
       }
+      case _ =>
+        throw new IllegalStateException(
+          "IndexedShuffleEquiJoinExec requires at least one indexed child"
+        )
     }
   }
 
