@@ -15,6 +15,14 @@ libraryDependencies ++= Seq(
   "org.slf4j" % "slf4j-api" % "2.0.16"
 )
 
+scalacOptions ++= Seq(
+  "-deprecation",
+  "-feature",
+  "-Xlint",
+  "-Wunused:imports,privates,locals,params,implicits",
+  "-Wconf:any:warning-verbose"
+)
+
 Test / fork := true
 
 // runMainでProvidedスコープの依存を含める
