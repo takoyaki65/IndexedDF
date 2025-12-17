@@ -29,23 +29,12 @@ object IndexedOperators extends SparkStrategy {
       Join(left, right, joinType, condition, JoinHint.NONE) match {
         case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, lChild, rChild, _) => {
           // compute the index of the left side keys == column number
-          var leftColNo = 0
-          var i = 0
-          lChild.output.foreach(col => {
-            if (col == leftKeys(0)) leftColNo = i
-            i += 1
-          })
-
+          // Use semanticEquals to compare attributes as they may have different metadata
+          val leftColNo = lChild.output.indexWhere(_.semanticEquals(leftKeys.head))
           // compute the index of the right side keys == column number
-          var rightColNo = 0
-          i = 0
-          rChild.output.foreach(col => {
-            if (col == rightKeys(0)) rightColNo = i
-            i += 1
-          })
+          val rightColNo = rChild.output.indexWhere(_.semanticEquals(rightKeys.head))
 
-          // println("leftcol = %d, rightcol = %d".format(leftColNo, rightColNo))
-          IndexedShuffledEquiJoinExec(planLater(left), planLater(right), leftColNo, rightColNo, leftKeys, rightKeys) :: Nil
+          IndexedShuffledEquiJoinExec(planLater(left), planLater(right), leftColNo, rightColNo) :: Nil
         }
         case _ => Nil
       }

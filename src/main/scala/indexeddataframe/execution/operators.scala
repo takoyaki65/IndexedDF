@@ -181,27 +181,23 @@ case class IndexedFilterExec(condition: Expression, child: SparkPlan) extends Un
   * @param leftCol
   *   the number of the column on which the join is performed for the left table
   * @param rightCol
-  *   the number of the column on which the join is performed for the left table
-  * @param leftKeys
-  *   the left join keys
-  * @param rightKeys
-  *   the right join keys
+  *   the number of the column on which the join is performed for the right table
   */
 case class IndexedShuffledEquiJoinExec(
     left: SparkPlan,
     right: SparkPlan,
     leftCol: Int,
-    rightCol: Int,
-    leftKeys: Seq[Expression],
-    rightKeys: Seq[Expression]
+    rightCol: Int
 ) extends BinaryExecNode {
   private val logger = LoggerFactory.getLogger(classOf[IndexedShuffledEquiJoinExec])
 
   override def output: Seq[Attribute] = left.output ++ right.output
 
-  // We're using this to force spark to shuffle the right relation in a similar way
-  // to the left indexed relation such that we can correctly do the join
-  override def requiredChildDistribution: Seq[Distribution] = Seq(ClusteredDistribution(leftKeys), ClusteredDistribution(rightKeys))
+  // Use child's output attributes directly to ensure exprId matches with child's outputPartitioning.
+  // This prevents Spark's EnsureRequirements from inserting unnecessary ShuffleExchangeExec
+  // when the indexed side is already hash-partitioned on the join column.
+  override def requiredChildDistribution: Seq[Distribution] =
+    Seq(ClusteredDistribution(Seq(left.output(leftCol))), ClusteredDistribution(Seq(right.output(rightCol))))
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[SparkPlan]
