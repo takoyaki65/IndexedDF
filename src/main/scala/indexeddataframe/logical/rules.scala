@@ -74,6 +74,8 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
   def joiningIndexedColumnLeft(left: IndexedBlockRDD, right: LogicalPlan, joinType: JoinType, condition: Option[Expression]): Boolean = {
     Join(left, right, joinType, condition, JoinHint.NONE) match {
       case ExtractEquiJoinKeys(_, leftKeys, _, _, _, lChild, _, _) =>
+        // Only support single-key joins; composite keys are not supported by IndexedJoin
+        if (leftKeys.length != 1) return false
         var leftColNo = 0
         var i = 0
         lChild.output.foreach(col => {
@@ -88,6 +90,8 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
   def joiningIndexedColumnRight(left: LogicalPlan, right: IndexedBlockRDD, joinType: JoinType, condition: Option[Expression]): Boolean = {
     Join(left, right, joinType, condition, JoinHint.NONE) match {
       case ExtractEquiJoinKeys(_, _, rightKeys, _, _, _, rChild, _) =>
+        // Only support single-key joins; composite keys are not supported by IndexedJoin
+        if (rightKeys.length != 1) return false
         var rightColNo = 0
         var i = 0
         rChild.output.foreach(col => {

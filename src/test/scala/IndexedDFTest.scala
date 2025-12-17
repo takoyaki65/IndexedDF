@@ -604,4 +604,120 @@ class IndexedDFTest extends AnyFunSuite {
     // Only id=1 matches (nulls don't match in standard SQL join)
     assert(result.collect().length == 1)
   }
+
+  // ============================================
+  // Composite key join tests - potential bug verification
+  // ============================================
+
+  test("composite key join should work correctly") {
+    // Test: Join with multiple equality conditions (composite key)
+    // This tests if IndexedShuffledEquiJoinExec correctly handles composite keys
+    // BUG: Currently only the first key is used, ignoring subsequent conditions
+    val dfA = Seq(
+      (1, 10, "a1"),
+      (1, 20, "a2"),
+      (2, 10, "a3"),
+      (2, 20, "a4")
+    ).toDF("key1", "key2", "valA")
+
+    val dfB = Seq(
+      (1, 10, "b1"), // Should match (1, 10, "a1")
+      (1, 30, "b2"), // Should NOT match (key2 doesn't match)
+      (2, 20, "b3")  // Should match (2, 20, "a4")
+    ).toDF("key1", "key2", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("composite_a")
+    dfB.createOrReplaceTempView("composite_b")
+
+    // Composite key join: key1 AND key2 must both match
+    val result = sparkSession.sql("""
+      SELECT * FROM composite_a
+      JOIN composite_b ON composite_a.key1 = composite_b.key1
+                      AND composite_a.key2 = composite_b.key2
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // Expected: only 2 rows should match (where BOTH key1 AND key2 match)
+    // BUG: If only key1 is used, we would get 4 rows instead
+    // (1,10) matches (1,10) -> 1 row
+    // (2,20) matches (2,20) -> 1 row
+    // Total: 2 rows
+    val count = result.collect().length
+    println(s"Composite key join result count: $count (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count - composite key join may be ignoring secondary key conditions")
+  }
+
+  test("composite key join - both sides indexed") {
+    // Test: Both sides are indexed, composite key join
+    val dfA = Seq(
+      (1, 10, "a1"),
+      (1, 20, "a2"),
+      (2, 10, "a3")
+    ).toDF("key1", "key2", "valA")
+
+    val dfB = Seq(
+      (1, 10, "b1"),
+      (1, 20, "b2"),
+      (2, 30, "b3")
+    ).toDF("key1", "key2", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("composite_both_a")
+    indexedB.createOrReplaceTempView("composite_both_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM composite_both_a
+      JOIN composite_both_b ON composite_both_a.key1 = composite_both_b.key1
+                           AND composite_both_a.key2 = composite_both_b.key2
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // Expected: 2 rows (1,10) and (1,20) match
+    val count = result.collect().length
+    println(s"Composite key join (both indexed) result count: $count (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  test("triple composite key join") {
+    // Test: Join with three key columns
+    val dfA = Seq(
+      (1, 10, 100, "a1"),
+      (1, 10, 200, "a2"),
+      (1, 20, 100, "a3")
+    ).toDF("k1", "k2", "k3", "valA")
+
+    val dfB = Seq(
+      (1, 10, 100, "b1"), // Matches a1
+      (1, 10, 300, "b2"), // No match (k3 differs)
+      (1, 20, 200, "b3")  // No match (k3 differs from a3)
+    ).toDF("k1", "k2", "k3", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("triple_a")
+    dfB.createOrReplaceTempView("triple_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM triple_a
+      JOIN triple_b ON triple_a.k1 = triple_b.k1
+                   AND triple_a.k2 = triple_b.k2
+                   AND triple_a.k3 = triple_b.k3
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // Only (1, 10, 100) matches
+    val count = result.collect().length
+    println(s"Triple composite key join result count: $count (expected: 1)")
+    assert(count == 1, s"Expected 1 row but got $count")
+  }
 }
