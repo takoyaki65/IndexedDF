@@ -85,54 +85,6 @@ class IndexedDFTest extends AnyFunSuite {
     assert(rows.collect().length == 2)
   }
 
-  test("appendRows") {
-
-    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
-    val df2 = Seq((1234, 7546, "a")).toDF("src", "dst", "tag")
-
-    val idf = df.createIndex(0).cache()
-    val idf2 = idf.appendRows(df2)
-    val idf3 = idf2.appendRows(df2)
-
-    idf2.explain()
-    idf3.explain()
-
-    val rows = idf.getRows(1234)
-    val rows2 = idf2.getRows(1234)
-    val rows3 = idf3.getRows(1234)
-
-    val r3 = rows3.collect()
-    val r2 = rows2.collect()
-    val r1 = rows.collect()
-
-    // check if the older dataframe does not see the update
-    assert(r1.length == 2 && r2.length == 3 && r3.length == 4)
-  }
-
-  test("appendRows (by name)") {
-
-    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
-    val df2 = Seq((1234, 7546, "a")).toDF("src", "dst", "tag")
-
-    val idf = df.createIndex("src").cache()
-    val idf2 = idf.appendRows(df2)
-    val idf3 = idf2.appendRows(df2)
-
-    idf2.explain()
-    idf3.explain()
-
-    val rows = idf.getRows(1234)
-    val rows2 = idf2.getRows(1234)
-    val rows3 = idf3.getRows(1234)
-
-    val r3 = rows3.collect()
-    val r2 = rows2.collect()
-    val r1 = rows.collect()
-
-    // check if the older dataframe does not see the update
-    assert(r1.length == 2 && r2.length == 3 && r3.length == 4)
-  }
-
   test("join") {
 
     val myDf = Seq((1234, 12345, "abcd"), (1234, 102, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag")
@@ -250,28 +202,406 @@ class IndexedDFTest extends AnyFunSuite {
     assert(result.collect().length == 2)
   }
 
-  test("divergence") {
+  // ============================================
+  // Multi-table join tests
+  // ============================================
 
-    val d1 = Seq((1230, 12345, "sdsad"), (1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag").cache()
-    val d2 = Seq((1235, 7546, "a")).toDF("src", "dst", "tag")
-    val d3 = Seq((1236, 7546, "a")).toDF("src", "dst", "tag")
+  test("three table chain join") {
+    // Test: A JOIN B JOIN C where A is indexed
+    val dfA = Seq((1, "a1"), (2, "a2"), (3, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2"), (4, "b4")).toDF("id", "valB")
+    val dfC = Seq((1, "c1"), (2, "c2"), (5, "c5")).toDF("id", "valC")
 
-    val table1 = d1.createIndex(0).cache()
-    val table2 = table1.appendRows(d2)
-    val table3 = table1.appendRows(d3)
+    val indexedA = dfA.createIndex(0).cache()
 
-    // idf2.explain()
-    // idf3.explain()
+    indexedA.createOrReplaceTempView("tableA")
+    dfB.createOrReplaceTempView("tableB")
+    dfC.createOrReplaceTempView("tableC")
 
-    // val rows = table1.getRows(1234)
-    val rows2 = table2.getRows(1236)
-    val rows3 = table3.getRows(1235)
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA
+      JOIN tableB ON tableA.id = tableB.id
+      JOIN tableC ON tableA.id = tableC.id
+    """)
 
-    val r3 = rows3.collect()
-    val r2 = rows2.collect()
-    // val r1 = rows.collect()
+    result.explain(true)
+    result.show()
 
-    // check if the older dataframe does not see the update
-    assert(r2.length == 0 && r3.length == 0)
+    // Only ids 1 and 2 are common to all three tables
+    assert(result.collect().length == 2)
+  }
+
+  test("three table chain join - all indexed") {
+    // Test: A JOIN B JOIN C where all tables are indexed
+    val dfA = Seq((1, "a1"), (2, "a2"), (3, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2"), (4, "b4")).toDF("id", "valB")
+    val dfC = Seq((1, "c1"), (2, "c2"), (5, "c5")).toDF("id", "valC")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+    val indexedC = dfC.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_all")
+    indexedB.createOrReplaceTempView("tableB_all")
+    indexedC.createOrReplaceTempView("tableC_all")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_all
+      JOIN tableB_all ON tableA_all.id = tableB_all.id
+      JOIN tableC_all ON tableA_all.id = tableC_all.id
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // Only ids 1 and 2 are common to all three tables
+    assert(result.collect().length == 2)
+  }
+
+  test("four table join") {
+    // Test: A JOIN B JOIN C JOIN D
+    val dfA = Seq((1, "a1"), (2, "a2"), (3, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2")).toDF("id", "valB")
+    val dfC = Seq((1, "c1"), (2, "c2"), (3, "c3")).toDF("id", "valC")
+    val dfD = Seq((1, "d1"), (2, "d2")).toDF("id", "valD")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA4")
+    dfB.createOrReplaceTempView("tableB4")
+    dfC.createOrReplaceTempView("tableC4")
+    dfD.createOrReplaceTempView("tableD4")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA4
+      JOIN tableB4 ON tableA4.id = tableB4.id
+      JOIN tableC4 ON tableA4.id = tableC4.id
+      JOIN tableD4 ON tableA4.id = tableD4.id
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // Only ids 1 and 2 are common to all four tables
+    assert(result.collect().length == 2)
+  }
+
+  test("join with duplicate keys in multiple tables") {
+    // Test: Joins with duplicate keys produce correct cartesian product
+    val dfA = Seq((1, "a1"), (1, "a2"), (2, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (1, "b2"), (2, "b3")).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_dup")
+    dfB.createOrReplaceTempView("tableB_dup")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_dup
+      JOIN tableB_dup ON tableA_dup.id = tableB_dup.id
+    """)
+
+    result.show()
+
+    // For id=1: 2 rows in A * 2 rows in B = 4 rows
+    // For id=2: 1 row in A * 1 row in B = 1 row
+    // Total: 5 rows
+    assert(result.collect().length == 5)
+  }
+
+  test("join result with createIndex") {
+    // Test: createIndex on join result
+    val dfA = Seq((1, "a1", 100), (2, "a2", 200), (3, "a3", 300)).toDF("id", "valA", "score")
+    val dfB = Seq((1, "b1"), (2, "b2")).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_nested")
+    dfB.createOrReplaceTempView("tableB_nested")
+
+    val joinedDF = sparkSession.sql("""
+      SELECT tableA_nested.id, valA, score, valB
+      FROM tableA_nested
+      JOIN tableB_nested ON tableA_nested.id = tableB_nested.id
+    """)
+
+    // Create index on the join result
+    val indexedJoined = joinedDF.createIndex(0).cache()
+
+    indexedJoined.explain(true)
+    indexedJoined.show()
+
+    // Verify data integrity
+    assert(indexedJoined.collect().length == 2)
+
+    // Test getRows on the new index
+    val rows = indexedJoined.getRows(1)
+    assert(rows.collect().length == 1)
+  }
+
+  test("createIndex after filter") {
+    // Test: createIndex on filtered DataFrame
+    val df = Seq((1, 100), (2, 200), (3, 300), (4, 400), (5, 500)).toDF("id", "value")
+
+    val filteredDF = df.filter("value >= 300")
+    val indexed = filteredDF.createIndex(0).cache()
+
+    indexed.show()
+
+    assert(indexed.collect().length == 3)
+
+    val rows = indexed.getRows(4)
+    assert(rows.collect().length == 1)
+  }
+
+  test("createIndex after select with new columns") {
+    // Test: createIndex on DataFrame with derived columns
+    val df = Seq((1, 100), (2, 200), (3, 300)).toDF("id", "value")
+
+    val derived = df.selectExpr("id", "value", "value * 2 as doubledValue")
+    val indexed = derived.createIndex(0).cache()
+
+    indexed.show()
+
+    assert(indexed.collect().length == 3)
+
+    val rows = indexed.getRows(2)
+    val row = rows.collect()(0)
+    assert(row.getInt(2) == 400) // doubledValue for id=2 should be 400
+  }
+
+  test("join with empty right table") {
+    // Test: Join with empty table should return empty result
+    val dfA = Seq((1, "a1"), (2, "a2")).toDF("id", "valA")
+    val dfB = Seq.empty[(Int, String)].toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_empty")
+    dfB.createOrReplaceTempView("tableB_empty")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_empty
+      JOIN tableB_empty ON tableA_empty.id = tableB_empty.id
+    """)
+
+    result.show()
+
+    assert(result.collect().length == 0)
+  }
+
+  test("join with no matching keys") {
+    // Test: Join with no matching keys should return empty result
+    val dfA = Seq((1, "a1"), (2, "a2")).toDF("id", "valA")
+    val dfB = Seq((3, "b3"), (4, "b4")).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_nomatch")
+    dfB.createOrReplaceTempView("tableB_nomatch")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_nomatch
+      JOIN tableB_nomatch ON tableA_nomatch.id = tableB_nomatch.id
+    """)
+
+    result.show()
+
+    assert(result.collect().length == 0)
+  }
+
+  test("large join with many partitions") {
+    // Test: Join with data that spans multiple partitions
+    val dataA = (1 to 1000).map(i => (i, s"a$i"))
+    val dataB = (500 to 1500).map(i => (i, s"b$i"))
+
+    val dfA = dataA.toDF("id", "valA")
+    val dfB = dataB.toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_large")
+    dfB.createOrReplaceTempView("tableB_large")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_large
+      JOIN tableB_large ON tableA_large.id = tableB_large.id
+    """)
+
+    // Matching ids are 500 to 1000 (501 values)
+    assert(result.collect().length == 501)
+  }
+
+  test("sequential joins reusing indexed table") {
+    // Test: Multiple sequential joins using the same indexed table
+    val dfA = Seq((1, "a1"), (2, "a2"), (3, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2")).toDF("id", "valB")
+    val dfC = Seq((2, "c2"), (3, "c3")).toDF("id", "valC")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_seq")
+    dfB.createOrReplaceTempView("tableB_seq")
+    dfC.createOrReplaceTempView("tableC_seq")
+
+    // First join
+    val result1 = sparkSession.sql("""
+      SELECT tableA_seq.id, valA, valB
+      FROM tableA_seq JOIN tableB_seq ON tableA_seq.id = tableB_seq.id
+    """)
+    assert(result1.collect().length == 2)
+
+    // Second join using same indexed table
+    val result2 = sparkSession.sql("""
+      SELECT tableA_seq.id, valA, valC
+      FROM tableA_seq JOIN tableC_seq ON tableA_seq.id = tableC_seq.id
+    """)
+    assert(result2.collect().length == 2)
+
+    // Original indexed table should still work
+    assert(indexedA.collect().length == 3)
+  }
+
+  test("join on different indexed columns") {
+    // Test: Index on column A but join on column B (fallback to regular join)
+    val dfA = Seq((1, 10, "a1"), (2, 20, "a2"), (3, 30, "a3")).toDF("id", "fk", "valA")
+    val dfB = Seq((10, "b10"), (20, "b20"), (40, "b40")).toDF("fk", "valB")
+
+    // Index A on id (column 0), but join on fk (column 1)
+    // This should fallback to a regular join since join column != indexed column
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_diffcol")
+    indexedB.createOrReplaceTempView("tableB_diffcol")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_diffcol
+      JOIN tableB_diffcol ON tableA_diffcol.fk = tableB_diffcol.fk
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // fk values 10 and 20 match
+    assert(result.collect().length == 2)
+  }
+
+  test("join using indexed column on right side") {
+    // Test: Right table is indexed on the join column
+    val dfA = Seq((10, "a10"), (20, "a20"), (30, "a30")).toDF("fk", "valA")
+    val dfB = Seq((10, "b10"), (20, "b20"), (40, "b40")).toDF("fk", "valB")
+
+    // Index B on fk (column 0), join on fk
+    val indexedB = dfB.createIndex(0).cache()
+
+    dfA.createOrReplaceTempView("tableA_rightidx")
+    indexedB.createOrReplaceTempView("tableB_rightidx")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_rightidx
+      JOIN tableB_rightidx ON tableA_rightidx.fk = tableB_rightidx.fk
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // fk values 10 and 20 match
+    assert(result.collect().length == 2)
+  }
+
+  test("mixed indexed and non-indexed multi-table join") {
+    // Test: Some tables indexed, some not
+    val dfA = Seq((1, "a1"), (2, "a2")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2")).toDF("id", "valB")
+    val dfC = Seq((1, "c1"), (2, "c2")).toDF("id", "valC")
+
+    val indexedA = dfA.createIndex(0).cache()
+    // B is not indexed
+    val indexedC = dfC.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_mixed")
+    dfB.createOrReplaceTempView("tableB_mixed")
+    indexedC.createOrReplaceTempView("tableC_mixed")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_mixed
+      JOIN tableB_mixed ON tableA_mixed.id = tableB_mixed.id
+      JOIN tableC_mixed ON tableA_mixed.id = tableC_mixed.id
+    """)
+
+    result.explain(true)
+    result.show()
+
+    assert(result.collect().length == 2)
+  }
+
+  test("self join on indexed table") {
+    // Test: Self join on an indexed table
+    val df = Seq((1, 2, "a"), (2, 3, "b"), (3, 1, "c")).toDF("id", "ref_id", "value")
+
+    val indexed = df.createIndex(0).cache()
+
+    indexed.createOrReplaceTempView("self_join_table")
+
+    val result = sparkSession.sql("""
+      SELECT t1.id, t1.value as val1, t2.value as val2
+      FROM self_join_table t1
+      JOIN self_join_table t2 ON t1.ref_id = t2.id
+    """)
+
+    result.show()
+
+    // Each row references another row:
+    // (1,2,a) -> id=2 exists -> match
+    // (2,3,b) -> id=3 exists -> match
+    // (3,1,c) -> id=1 exists -> match
+    assert(result.collect().length == 3)
+  }
+
+  test("createIndex on already indexed then join") {
+    // Test: createIndex on an indexed DataFrame (re-index)
+    val df = Seq((1, 10, "a"), (2, 20, "b"), (3, 30, "c")).toDF("id", "fk", "value")
+    val dfJoin = Seq((10, "x"), (20, "y")).toDF("fk", "extra")
+
+    // First index on id
+    val indexed1 = df.createIndex(0).cache()
+    // Re-index on fk (column 1)
+    val indexed2 = indexed1.createIndex(1).cache()
+
+    indexed2.createOrReplaceTempView("reindexed_table")
+    dfJoin.createOrReplaceTempView("join_fk_table")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM reindexed_table
+      JOIN join_fk_table ON reindexed_table.fk = join_fk_table.fk
+    """)
+
+    result.explain(true)
+    result.show()
+
+    // fk=10 and fk=20 match
+    assert(result.collect().length == 2)
+  }
+
+  test("join with null values in key column") {
+    // Test: Null values in join keys should not match
+    val dfA = Seq((Some(1), "a1"), (Some(2), "a2"), (None, "a_null")).toDF("id", "valA")
+    val dfB = Seq((Some(1), "b1"), (None, "b_null")).toDF("id", "valB")
+
+    val indexedA = dfA.na.drop("any", Seq("id")).createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("tableA_null")
+    dfB.createOrReplaceTempView("tableB_null")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM tableA_null
+      JOIN tableB_null ON tableA_null.id = tableB_null.id
+    """)
+
+    result.show()
+
+    // Only id=1 matches (nulls don't match in standard SQL join)
+    assert(result.collect().length == 1)
   }
 }

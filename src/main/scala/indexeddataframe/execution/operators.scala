@@ -39,25 +39,6 @@ trait IndexedOperatorExec extends SparkPlan {
   // the number of the indexed column
   def indexColNo = 0
 
-  // helper method to find the IndexedOperatorExec in the plan tree
-  // This is used to find the indexed operator when spark inserts additional operators in the plan tree
-  // like ShuffleExchangeExec, etc.
-  protected def findIndexedOperator(plan: SparkPlan): IndexedOperatorExec = {
-    plan match {
-      case indexed: IndexedOperatorExec => indexed
-      case other if other.children.nonEmpty =>
-        other.children
-          .flatMap(child =>
-            try Some(findIndexedOperator(child))
-            catch { case _: IllegalStateException => None }
-          )
-          .headOption
-          .getOrElse(throw new IllegalStateException(s"IndexedOperatorExec not found in plan tree: $plan"))
-      case _ =>
-        throw new IllegalStateException(s"IndexedOperatorExec not found in plan tree: $plan")
-    }
-  }
-
   /** if the indexed operator is required to return rows (i.e., as for a regular spark DF operations) produce its rows by scanning the index
     */
   override def doExecute() = {
@@ -115,48 +96,6 @@ case class CreateIndexExec(override val indexColNo: Int, child: SparkPlan) exten
       .mapPartitions[InternalIndexedDF](rowIter => Iterator(Utils.doIndexing(indexColNo, rowIter, output.map(_.dataType), output)), true)
     val ret = new IRDD(indexColNo, partitions)
     Utils.ensureCached(ret)
-  }
-}
-
-/** physical operator that appends rows to an indexed DataFrame
-  * @param left
-  *   the indexed DataFrame
-  * @param right
-  *   a regular DataFrame
-  */
-case class AppendRowsExec(left: SparkPlan, right: SparkPlan) extends BinaryExecNode with IndexedOperatorExec {
-  private val logger = LoggerFactory.getLogger(classOf[AppendRowsExec])
-
-  override def output: Seq[Attribute] = left.output
-
-  // find the indexed operator in the left plan in case spark has added additional operators like ShuffleExchangeExec, etc.
-  private lazy val leftIndexedOp: IndexedOperatorExec = findIndexedOperator(left)
-
-  override def indexColNo = leftIndexedOp.indexColNo
-  def distributionOutput = leftIndexedOp.indexColNo
-
-  override def outputPartitioning = left.outputPartitioning
-  override def requiredChildDistribution: Seq[Distribution] =
-    Seq(ClusteredDistribution(Seq(output(distributionOutput))), ClusteredDistribution(Seq(right.output(distributionOutput))))
-
-  override protected def withNewChildrenInternal(
-      newChildren: IndexedSeq[SparkPlan]
-  ): AppendRowsExec =
-    copy(left = newChildren(0), right = newChildren(1))
-
-  override def executeIndexed(): IRDD = {
-    logger.debug("executing the appendRows operator")
-    val leftRDD = findIndexedOperator(left).executeIndexed()
-    val rightRDD = right.execute()
-
-    val zippedResult = leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
-      val idf = leftIter.next().getSnapshot()
-      while (rightIter.hasNext) {
-        idf.appendRow(rightIter.next())
-      }
-      Iterator(idf)
-    }
-    Utils.ensureCached(new IRDD(leftRDD.colNo, zippedResult))
   }
 }
 
@@ -270,14 +209,10 @@ case class IndexedShuffledEquiJoinExec(
     copy(left = newChildren(0), right = newChildren(1))
 
   // helper method to find the IndexedOperatorExec in the plan tree
-  // This is used to find the indexed operator when spark inserts additional operators in the plan tree
-  // like ShuffleExchangeExec, etc.
   private def findIndexedOp(plan: SparkPlan): Option[IndexedOperatorExec] = {
     plan match {
       case indexed: IndexedOperatorExec => Some(indexed)
-      case other if other.children.nonEmpty =>
-        other.children.flatMap(findIndexedOp).headOption
-      case _ => None
+      case _                            => None
     }
   }
 
@@ -287,44 +222,51 @@ case class IndexedShuffledEquiJoinExec(
     val leftSchema = StructType(left.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
     val rightSchema = StructType(right.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
 
-    // check which side is indexed
+    // check which side is indexed AND whether join column matches the indexed column
     val leftIndexedOp = findIndexedOp(left)
     val rightIndexedOp = findIndexedOp(right)
 
-    (leftIndexedOp, rightIndexedOp) match {
-      case (Some(indexedLeft), _) => {
+    // Only use the indexed side if the join column matches the indexed column
+    val useLeftIndex = leftIndexedOp.exists(op => op.indexColNo == leftCol)
+    val useRightIndex = rightIndexedOp.exists(op => op.indexColNo == rightCol)
+
+    (useLeftIndex, useRightIndex, leftIndexedOp, rightIndexedOp) match {
+      case (true, _, Some(indexedLeft), _) => {
         val leftRDD = indexedLeft.executeIndexed()
         val rightRDD = right.execute()
 
         val result = leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
           // generate an unsafe row joiner
-          leftSchema.add("prev", IntegerType)
-          val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
+          // Create a copy of leftSchema to avoid mutating the original
+          val leftSchemaWithPrev = leftSchema.add("prev", IntegerType)
+          val joiner = GenerateUnsafeRowJoiner.create(leftSchemaWithPrev, rightSchema)
           if (leftIter.hasNext) {
             val result = leftIter.next().multigetJoinedRight(rightIter, joiner, right.output, rightCol)
             result
-          } else Iterator(null)
+          } else Iterator.empty
         }
         result
       }
-      case (_, Some(indexedRight)) => {
+      case (_, true, _, Some(indexedRight)) => {
         val leftRDD = left.execute()
         val rightRDD = indexedRight.executeIndexed()
 
         val result = rightRDD.partitionsRDD.zipPartitions(leftRDD, true) { (rightIter, leftIter) =>
           // generate an unsafe row joiner
-          rightSchema.add("prev", IntegerType)
-          val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
+          // Create a copy of rightSchema to avoid mutating the original
+          val rightSchemaWithPrev = rightSchema.add("prev", IntegerType)
+          val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchemaWithPrev)
           if (rightIter.hasNext) {
             val result = rightIter.next().multigetJoinedLeft(leftIter, joiner, left.output, leftCol)
             result
-          } else Iterator(null)
+          } else Iterator.empty
         }
         result
       }
       case _ =>
         throw new IllegalStateException(
-          "IndexedShuffleEquiJoinExec requires at least one indexed child"
+          s"IndexedShuffleEquiJoinExec requires at least one indexed child where join column matches index column. " +
+            s"leftCol=$leftCol, rightCol=$rightCol, leftIndexColNo=${leftIndexedOp.map(_.indexColNo)}, rightIndexColNo=${rightIndexedOp.map(_.indexColNo)}"
         )
     }
   }

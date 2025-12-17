@@ -17,16 +17,6 @@ case class CreateIndex(val colNo: Int, child: LogicalPlan) extends UnaryNode wit
   ): CreateIndex = copy(child = newChild)
 }
 
-case class AppendRows(left: LogicalPlan, right: LogicalPlan) extends BinaryNode with IndexedOperator {
-
-  override def output: Seq[Attribute] = left.output
-  override protected def withNewChildrenInternal(
-      newLeft: LogicalPlan,
-      newRight: LogicalPlan
-  ): AppendRows =
-    copy(left = newLeft, right = newRight)
-}
-
 case class GetRows(val key: AnyVal, child: LogicalPlan) extends UnaryNode with IndexedOperator {
   override def output: Seq[Attribute] = child.output
   override protected def withNewChildInternal(newChild: LogicalPlan): GetRows =

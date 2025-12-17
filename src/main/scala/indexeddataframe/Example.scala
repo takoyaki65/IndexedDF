@@ -80,17 +80,6 @@ object Example {
     println(s"Join result: $joinCount rows in ${(t6 - t5) / 1000000.0} ms")
     joinResult.show(10)
 
-    // 5. 行追加 (Copy-on-Write)
-    println("--- 5. Append Rows (Copy-on-Write) ---")
-    val newEdges = Seq((9999L, 1L, "new_edge")).toDF("src", "dst", "label")
-    val updatedDF = indexedDF.appendRows(newEdges)
-
-    val originalCount = indexedDF.getRows(9999L).count()
-    val updatedCount = updatedDF.getRows(9999L).count()
-    println(s"Original DF rows with src=9999: $originalCount")
-    println(s"Updated DF rows with src=9999: $updatedCount")
-    println("(Copy-on-Write: original DF is unchanged)\n")
-
     println("=== Demo Complete ===")
     sparkSession.stop()
   }
@@ -236,52 +225,6 @@ object BenchmarkPrograms {
     println("proj on Indexed DataFrame took %f ms".format(totalTime / ((nTimesRun - 1) * 1000000.0)))
   }
 
-  def runAppend(indexedDF: DataFrame, appendDF: DataFrame, sparkSession: SparkSession): Unit = {
-    var indexedDFRes = indexedDF.appendRows(appendDF).cache()
-    var totalTime = 0.0
-    for (i <- 1 to nTimesRun) {
-      val t1 = System.nanoTime()
-      indexedDFRes = indexedDFRes.appendRows(appendDF)
-      val t2 = System.nanoTime()
-      println("append iteration %d took %f".format(i, (t2 - t1) / 1000000.0))
-      if (i > 1) totalTime += (t2 - t1)
-    }
-    val t1 = System.nanoTime()
-    val nRows = indexedDFRes.count()
-    val t2 = System.nanoTime()
-    println("resulting DF size = " + nRows)
-    println("append on Indexed DataFrame took %f ms".format(totalTime / 1000000.0))
-  }
-
-  def runJoinAppend(indexedDF: DataFrame, nodesDF: DataFrame, appendDF: DataFrame, sparkSession: SparkSession): Unit = {
-    var indexedDFRes = indexedDF.appendRows(appendDF).cache()
-    var res: DataFrame = null
-    var totalTime = 0.0
-    for (i <- 1 to nTimesRun) {
-      val t1 = System.nanoTime()
-
-      indexedDFRes.createOrReplaceTempView("edges")
-      nodesDF.createOrReplaceTempView("vertices")
-
-      res = sparkSession.sql(
-        "SELECT * " +
-          "FROM edges " +
-          "JOIN vertices " +
-          "ON edges.src = vertices.id"
-      )
-      triggerExecutionDF(res)
-
-      if (i % 5 == 0) indexedDFRes = indexedDFRes.appendRows(appendDF).cache()
-
-      val t2 = System.nanoTime()
-      println("join iteration %d took %f".format(i, (t2 - t1) / 1000000.0))
-
-      if (i > 1) totalTime += (t2 - t1)
-    }
-    println("resulting DF size = " + res.count())
-    println("joinAppend on Indexed DataFrame took %f ms".format(totalTime / ((nTimesRun - 1) * 1000000.0)))
-  }
-
   def getSizeInBytes(df: DataFrame): Unit = {
     // df.queryExecution.optimizedPlan.statistics.sizeInBytes
   }
@@ -394,9 +337,6 @@ object BenchmarkPrograms {
     val nodes = (1 to 1000).map(i => (i.toLong, s"name_$i"))
     var nodesDF = nodes.toDF("id", "name").cache()
 
-    val appendData = (10001 to 10100).map(i => (i.toLong, (i % 100).toLong, 2.0f))
-    val appendDF = appendData.toDF("src", "dst", "cost")
-
     triggerExecutionDF(nodesDF)
     triggerExecutionDF(edgesDF)
 
@@ -424,9 +364,6 @@ object BenchmarkPrograms {
     println()
 
     runJoin(indexedDF, nodesDF, sparkSession)
-    println()
-
-    runAppend(indexedDF, appendDF, sparkSession)
     println()
 
     indexedDF.show(10)

@@ -13,7 +13,6 @@ import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 object IndexedOperators extends SparkStrategy {
   def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case CreateIndex(colNo, child) => CreateIndexExec(colNo, planLater(child)) :: Nil
-    case AppendRows(left, right)   => AppendRowsExec(planLater(left), planLater(right)) :: Nil
     /** this is a strategy for eliminating the [InMemoryRelation] that spark generates when .cache() is called on an ordinary dataframe; in that case,
       * the representation of the data frame is changed to a CachedBatch; we cannot have that on the indexed data frames as we would lose the indexing
       * capabilities; therefore, we just insert a dummy strategy that returns an operator which works on "indexed RDDs"
