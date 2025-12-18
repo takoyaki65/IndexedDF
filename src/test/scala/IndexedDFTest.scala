@@ -623,7 +623,7 @@ class IndexedDFTest extends AnyFunSuite {
     val dfB = Seq(
       (1, 10, "b1"), // Should match (1, 10, "a1")
       (1, 30, "b2"), // Should NOT match (key2 doesn't match)
-      (2, 20, "b3")  // Should match (2, 20, "a4")
+      (2, 20, "b3") // Should match (2, 20, "a4")
     ).toDF("key1", "key2", "valB")
 
     val indexedA = dfA.createIndex(0).cache()
@@ -697,7 +697,7 @@ class IndexedDFTest extends AnyFunSuite {
     val dfB = Seq(
       (1, 10, 100, "b1"), // Matches a1
       (1, 10, 300, "b2"), // No match (k3 differs)
-      (1, 20, 200, "b3")  // No match (k3 differs from a3)
+      (1, 20, 200, "b3") // No match (k3 differs from a3)
     ).toDF("k1", "k2", "k3", "valB")
 
     val indexedA = dfA.createIndex(0).cache()
