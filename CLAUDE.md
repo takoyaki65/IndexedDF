@@ -120,3 +120,13 @@ sbt test
 ```
 
 テストケース: createIndex, getRows, filter, appendRows, join, join2, string index, divergence
+
+## 制限事項
+
+- **サポートするJoin Type**: 現在はINNER JOINのみをサポート。Semi-Join、Anti-Join、Outer-Joinが検出された場合は通常のSpark Joinにフォールバックする
+
+## Future Work
+
+- **Semi-Join対応**: LEFT SEMI JOIN、LEFT ANTI JOINをインデックスを活用して高速化
+- **Outer-Join対応**: LEFT/RIGHT/FULL OUTER JOINをインデックスを活用して高速化
+- **AQE対応**: Adaptive Query Execution (AQE) との互換性改善

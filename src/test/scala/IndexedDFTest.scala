@@ -720,4 +720,419 @@ class IndexedDFTest extends AnyFunSuite {
     println(s"Triple composite key join result count: $count (expected: 1)")
     assert(count == 1, s"Expected 1 row but got $count")
   }
+
+  // ============================================
+  // Semi-Join and Outer-Join tests
+  // These tests verify whether IndexedShuffledEquiJoinExec
+  // correctly handles different join types or produces wrong results
+  // ============================================
+
+  test("left semi join - indexed left") {
+    // LEFT SEMI JOIN returns rows from left table that have matching rows in right table
+    // Output should only contain left table columns
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (4, "b4") // id=4 doesn't exist in A
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("semi_left_a")
+    dfB.createOrReplaceTempView("semi_left_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM semi_left_a
+      WHERE EXISTS (SELECT 1 FROM semi_left_b WHERE semi_left_a.id = semi_left_b.id)
+    """)
+
+    result.explain(true)
+    println("=== Left Semi Join (EXISTS) Result ===")
+    result.show()
+
+    // Expected: rows with id=1 and id=2 from A (2 rows)
+    // Output columns should be only from A: (id, valA)
+    val count = result.collect().length
+    val cols = result.columns.length
+    println(s"Left Semi Join result: $count rows, $cols columns (expected: 2 rows, 2 columns)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+    assert(cols == 2, s"Expected 2 columns (only from left) but got $cols")
+  }
+
+  test("left semi join - SQL syntax") {
+    // Explicit LEFT SEMI JOIN syntax
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("semi_sql_a")
+    dfB.createOrReplaceTempView("semi_sql_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM semi_sql_a LEFT SEMI JOIN semi_sql_b ON semi_sql_a.id = semi_sql_b.id
+    """)
+
+    result.explain(true)
+    println("=== Left Semi Join (SQL) Result ===")
+    result.show()
+
+    val count = result.collect().length
+    val cols = result.columns.length
+    println(s"Left Semi Join (SQL) result: $count rows, $cols columns (expected: 2 rows, 2 columns)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+    assert(cols == 2, s"Expected 2 columns but got $cols")
+  }
+
+  test("left anti join - indexed left") {
+    // LEFT ANTI JOIN returns rows from left table that have NO matching rows in right table
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("anti_a")
+    dfB.createOrReplaceTempView("anti_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM anti_a
+      WHERE NOT EXISTS (SELECT 1 FROM anti_b WHERE anti_a.id = anti_b.id)
+    """)
+
+    result.explain(true)
+    println("=== Left Anti Join Result ===")
+    result.show()
+
+    // Expected: only id=3 from A (1 row)
+    val count = result.collect().length
+    println(s"Left Anti Join result: $count rows (expected: 1)")
+    assert(count == 1, s"Expected 1 row but got $count")
+  }
+
+  test("left anti join - SQL syntax") {
+    // Explicit LEFT ANTI JOIN syntax
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("anti_sql_a")
+    dfB.createOrReplaceTempView("anti_sql_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM anti_sql_a LEFT ANTI JOIN anti_sql_b ON anti_sql_a.id = anti_sql_b.id
+    """)
+
+    result.explain(true)
+    println("=== Left Anti Join (SQL) Result ===")
+    result.show()
+
+    val count = result.collect().length
+    println(s"Left Anti Join (SQL) result: $count rows (expected: 1)")
+    assert(count == 1, s"Expected 1 row but got $count")
+  }
+
+  test("left outer join - indexed left") {
+    // LEFT OUTER JOIN returns all rows from left, with nulls for non-matching right rows
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (4, "b4")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("left_outer_a")
+    dfB.createOrReplaceTempView("left_outer_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM left_outer_a
+      LEFT OUTER JOIN left_outer_b ON left_outer_a.id = left_outer_b.id
+    """)
+
+    result.explain(true)
+    println("=== Left Outer Join Result ===")
+    result.show()
+
+    // Expected: 3 rows (all from A)
+    // id=1: (1, a1, 1, b1)
+    // id=2: (2, a2, 2, b2)
+    // id=3: (3, a3, null, null)
+    val collected = result.collect()
+    val count = collected.length
+    println(s"Left Outer Join result: $count rows (expected: 3)")
+    assert(count == 3, s"Expected 3 rows but got $count")
+
+    // Check that id=3 has null values for right side
+    val row3 = collected.find(_.getInt(0) == 3)
+    assert(row3.isDefined, "Row with id=3 should exist")
+    assert(row3.get.isNullAt(2) || row3.get.isNullAt(3), "Right side columns should be null for id=3")
+  }
+
+  test("right outer join - indexed left") {
+    // RIGHT OUTER JOIN returns all rows from right, with nulls for non-matching left rows
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("right_outer_a")
+    dfB.createOrReplaceTempView("right_outer_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM right_outer_a
+      RIGHT OUTER JOIN right_outer_b ON right_outer_a.id = right_outer_b.id
+    """)
+
+    result.explain(true)
+    println("=== Right Outer Join Result ===")
+    result.show()
+
+    // Expected: 3 rows (all from B)
+    // id=1: (1, a1, 1, b1)
+    // id=2: (2, a2, 2, b2)
+    // id=3: (null, null, 3, b3)
+    val collected = result.collect()
+    val count = collected.length
+    println(s"Right Outer Join result: $count rows (expected: 3)")
+    assert(count == 3, s"Expected 3 rows but got $count")
+  }
+
+  test("full outer join - indexed left") {
+    // FULL OUTER JOIN returns all rows from both tables
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("full_outer_a")
+    dfB.createOrReplaceTempView("full_outer_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM full_outer_a
+      FULL OUTER JOIN full_outer_b ON full_outer_a.id = full_outer_b.id
+    """)
+
+    result.explain(true)
+    println("=== Full Outer Join Result ===")
+    result.show()
+
+    // Expected: 3 rows
+    // id=1: (1, a1, null, null)
+    // id=2: (2, a2, 2, b2)
+    // id=3: (null, null, 3, b3)
+    val count = result.collect().length
+    println(s"Full Outer Join result: $count rows (expected: 3)")
+    assert(count == 3, s"Expected 3 rows but got $count")
+  }
+
+  test("left outer join - indexed right") {
+    // LEFT OUTER JOIN where the right side is indexed
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2")
+    ).toDF("id", "valB")
+
+    val indexedB = dfB.createIndex(0).cache()
+
+    dfA.createOrReplaceTempView("left_outer_right_idx_a")
+    indexedB.createOrReplaceTempView("left_outer_right_idx_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM left_outer_right_idx_a
+      LEFT OUTER JOIN left_outer_right_idx_b ON left_outer_right_idx_a.id = left_outer_right_idx_b.id
+    """)
+
+    result.explain(true)
+    println("=== Left Outer Join (Right Indexed) Result ===")
+    result.show()
+
+    // Expected: 3 rows
+    val count = result.collect().length
+    println(s"Left Outer Join (Right Indexed) result: $count rows (expected: 3)")
+    assert(count == 3, s"Expected 3 rows but got $count")
+  }
+
+  test("right outer join - indexed right") {
+    // RIGHT OUTER JOIN where the right side is indexed
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedB = dfB.createIndex(0).cache()
+
+    dfA.createOrReplaceTempView("right_outer_right_idx_a")
+    indexedB.createOrReplaceTempView("right_outer_right_idx_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM right_outer_right_idx_a
+      RIGHT OUTER JOIN right_outer_right_idx_b ON right_outer_right_idx_a.id = right_outer_right_idx_b.id
+    """)
+
+    result.explain(true)
+    println("=== Right Outer Join (Right Indexed) Result ===")
+    result.show()
+
+    // Expected: 3 rows
+    val count = result.collect().length
+    println(s"Right Outer Join (Right Indexed) result: $count rows (expected: 3)")
+    assert(count == 3, s"Expected 3 rows but got $count")
+  }
+
+  test("left semi join with duplicates") {
+    // LEFT SEMI JOIN should not produce duplicates even if right has multiple matches
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (1, "b1_dup"), // Duplicate key in right
+      (2, "b2")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("semi_dup_a")
+    dfB.createOrReplaceTempView("semi_dup_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM semi_dup_a LEFT SEMI JOIN semi_dup_b ON semi_dup_a.id = semi_dup_b.id
+    """)
+
+    result.explain(true)
+    println("=== Left Semi Join with Duplicates Result ===")
+    result.show()
+
+    // Expected: 2 rows (no duplicates from semi join)
+    val count = result.collect().length
+    println(s"Left Semi Join with Duplicates result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count - semi join should not produce duplicates")
+  }
+
+  test("cross join - should not use indexed join") {
+    // CROSS JOIN should not use IndexedJoin
+    val dfA = Seq((1, "a1"), (2, "a2")).toDF("id", "valA")
+    val dfB = Seq((10, "b1"), (20, "b2")).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("cross_a")
+    dfB.createOrReplaceTempView("cross_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM cross_a CROSS JOIN cross_b
+    """)
+
+    result.explain(true)
+    println("=== Cross Join Result ===")
+    result.show()
+
+    // Expected: 2 * 2 = 4 rows (cartesian product)
+    val count = result.collect().length
+    println(s"Cross Join result: $count rows (expected: 4)")
+    assert(count == 4, s"Expected 4 rows but got $count")
+  }
+
+  test("left outer join with duplicates on both sides") {
+    // Test LEFT OUTER JOIN with duplicate keys
+    val dfA = Seq(
+      (1, "a1"),
+      (1, "a1_dup"),
+      (2, "a2")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (1, "b1_dup"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("left_outer_dup_a")
+    dfB.createOrReplaceTempView("left_outer_dup_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM left_outer_dup_a
+      LEFT OUTER JOIN left_outer_dup_b ON left_outer_dup_a.id = left_outer_dup_b.id
+    """)
+
+    result.explain(true)
+    println("=== Left Outer Join with Duplicates Result ===")
+    result.show()
+
+    // Expected:
+    // id=1: 2 rows in A * 2 rows in B = 4 rows
+    // id=2: 1 row in A * 0 rows in B = 1 row (with nulls)
+    // Total: 5 rows
+    val count = result.collect().length
+    println(s"Left Outer Join with Duplicates result: $count rows (expected: 5)")
+    assert(count == 5, s"Expected 5 rows but got $count")
+  }
 }

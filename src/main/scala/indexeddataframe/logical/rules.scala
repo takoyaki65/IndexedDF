@@ -8,7 +8,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, Expression, IsNotNull}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
-import org.apache.spark.sql.catalyst.plans.JoinType
+import org.apache.spark.sql.catalyst.plans.{Inner, JoinType}
 import org.slf4j.LoggerFactory
 
 import scala.collection.concurrent.TrieMap
@@ -120,12 +120,13 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     case InMemoryRelationMatcher(output, _, child: IndexedOperatorExec) =>
       IndexedBlockRDD(output, getIfCached(child), child)
 
-    /** apply indexed join only on indexed data
+    /** apply indexed join only on indexed data (Inner Join only) Semi-Join, Anti-Join, Outer-Join are not supported and will fallback to Spark's
+      * default join TODO: support other join types
       */
-    case Join(left: IndexedBlockRDD, right, joinType, condition, _) if joiningIndexedColumnLeft(left, right, joinType, condition) =>
+    case Join(left: IndexedBlockRDD, right, joinType @ Inner, condition, _) if joiningIndexedColumnLeft(left, right, joinType, condition) =>
       IndexedJoin(left.asInstanceOf[IndexedOperator], right, joinType, condition)
 
-    case Join(left, right: IndexedBlockRDD, joinType, condition, _) if joiningIndexedColumnRight(left, right, joinType, condition) =>
+    case Join(left, right: IndexedBlockRDD, joinType @ Inner, condition, _) if joiningIndexedColumnRight(left, right, joinType, condition) =>
       IndexedJoin(left, right.asInstanceOf[IndexedOperator], joinType, condition)
 
     /** apply indexed filtering only on filtered data
@@ -145,7 +146,7 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     case Join(
           left @ IndexedFilter(conditionLeft: EqualTo, _),
           right @ IndexedFilter(conditionRight: EqualTo, rightChild),
-          joinType,
+          joinType @ Inner,
           Some(condition: EqualTo),
           _
         ) if joinSameFilterColumns(condition, conditionLeft, conditionRight) =>
