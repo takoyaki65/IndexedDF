@@ -130,3 +130,5 @@ sbt test
 - **Semi-Join対応**: LEFT SEMI JOIN、LEFT ANTI JOINをインデックスを活用して高速化
 - **Outer-Join対応**: LEFT/RIGHT/FULL OUTER JOINをインデックスを活用して高速化
 - **AQE対応**: Adaptive Query Execution (AQE) との互換性改善
+- **複合キーインデックス**: 複数カラムを組み合わせたインデックスのサポート
+- **最適化ルールの拡充**: より多くのクエリパターンに対するインデックス利用の最適化ルール追加
