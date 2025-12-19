@@ -25,68 +25,181 @@ package indexeddataframe
 
 import org.apache.spark.sql.catalyst.expressions.codegen._
 
-import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeRow}
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.unsafe.Platform
 
+/**
+ * Abstract class for joining two UnsafeRows into a single UnsafeRow.
+ *
+ * Key difference from Spark's standard UnsafeRowJoiner:
+ * - Standard UnsafeRowJoiner allocates its own internal memory buffer
+ * - This custom version uses an externally provided buffer (off-heap memory address)
+ *
+ * This design enables direct writing of join results to RowBatch's off-heap memory,
+ * avoiding additional memory allocations and improving performance during IndexedJoin operations.
+ */
 abstract class CustomUnsafeRowJoiner {
+
+  /**
+   * Joins two UnsafeRows into one.
+   *
+   * @param row1 The left row (typically from the indexed table)
+   * @param row2 The right row (from the table being joined)
+   * @param buf  Off-heap memory address to write the result (obtained via RowBatch.getCurrentPointer())
+   * @return A new UnsafeRow pointing to the buffer containing the concatenated data
+   */
   def join(row1: UnsafeRow, row2: UnsafeRow, buf: Long): UnsafeRow
 }
 
-/** A code generator for concatenating two [[UnsafeRow]]s into a single [[UnsafeRow]].
-  *
-  * The high level algorithm is:
-  *
-  *   1. Concatenate the two bitsets together into a single one, taking padding into account. 2. Move fixed-length data. 3. Move variable-length data.
-  *      4. Update the offset position (i.e. the upper 32 bits in the fixed length part) for all variable-length data.
-  */
+/**
+ * Code generator that creates a specialized [[CustomUnsafeRowJoiner]] for concatenating
+ * two [[UnsafeRow]]s with specific schemas into a single [[UnsafeRow]].
+ *
+ * == UnsafeRow Memory Layout ==
+ *
+ * An UnsafeRow consists of three regions stored contiguously in memory:
+ *
+ * {{{
+ * +------------------+----------------------+---------------------+
+ * |  Null Bit Set    |  Fixed-Length Data   | Variable-Length Data|
+ * | (8 bytes/64 cols)|  (8 bytes per field) |   (actual bytes)    |
+ * +------------------+----------------------+---------------------+
+ * }}}
+ *
+ * - '''Null Bit Set''': One bit per column, packed into 64-bit words.
+ *   Number of words = ceil(numColumns / 64)
+ *
+ * - '''Fixed-Length Data''': 8 bytes per column.
+ *   - For fixed-length types (int, long, double): stores the actual value
+ *   - For variable-length types (string, array): stores offset (upper 32 bits) and size (lower 32 bits)
+ *
+ * - '''Variable-Length Data''': Actual bytes for variable-length columns (strings, arrays, etc.)
+ *
+ * == Join Algorithm ==
+ *
+ * The high-level algorithm for joining two UnsafeRows:
+ *
+ *   1. '''Concatenate Bitsets''': Merge the two null bit sets into one.
+ *      Special handling is needed when row1's column count is not a multiple of 64,
+ *      requiring bit shifting to properly align row2's bits.
+ *
+ *   2. '''Copy Fixed-Length Data''': Copy both rows' fixed-length sections sequentially.
+ *
+ *   3. '''Copy Variable-Length Data''': Append row1's variable data, then row2's.
+ *
+ *   4. '''Update Offsets''': For variable-length columns, the offset values in the
+ *      fixed-length section must be adjusted because:
+ *      - The bitset size may have changed
+ *      - Row2's offsets need to account for row1's variable data
+ *
+ * == Generated Code Structure ==
+ *
+ * This generator produces a specialized class like:
+ * {{{
+ * class SpecificUnsafeRowJoiner extends CustomUnsafeRowJoiner {
+ *   def join(row1: UnsafeRow, row2: UnsafeRow, buf: Long): UnsafeRow = {
+ *     // Copy bitsets with proper alignment
+ *     // Copy fixed-length sections
+ *     // Copy variable-length sections
+ *     // Adjust offsets for variable-length fields
+ *     // Return UnsafeRow pointing to buf
+ *   }
+ * }
+ * }}}
+ *
+ * The generated code is compiled at runtime using Spark's CodeGenerator framework
+ * and cached for reuse with the same schema pair.
+ */
 object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructType), CustomUnsafeRowJoiner] {
 
+  /**
+   * Creates a CustomUnsafeRowJoiner for the given schema pair.
+   * This method is called by the CodeGenerator caching mechanism.
+   */
   override protected def create(in: (StructType, StructType)): CustomUnsafeRowJoiner = {
     create(in._1, in._2)
   }
 
+  /**
+   * Returns the input as-is since no canonicalization is needed for schema pairs.
+   */
   override protected def canonicalize(in: (StructType, StructType)): (StructType, StructType) = in
 
+  /**
+   * Returns the input as-is since schema pairs don't require binding to input schemas.
+   */
   override protected def bind(in: (StructType, StructType), inputSchema: Seq[Attribute]): (StructType, StructType) = {
     in
   }
 
+  /**
+   * Creates a specialized CustomUnsafeRowJoiner for the given schemas.
+   *
+   * @param schema1 Schema of the left row (from indexed table)
+   * @param schema2 Schema of the right row (from joined table)
+   * @return A compiled joiner optimized for these specific schemas
+   */
   def create(schema1: StructType, schema2: StructType): CustomUnsafeRowJoiner = {
     val ctx = new CodegenContext
+    // Note: offset is 0 because we write directly to off-heap memory (not a byte array)
+    // When writing to a byte array, Platform.BYTE_ARRAY_OFFSET would be used
     val offset = 0 // Platform.BYTE_ARRAY_OFFSET
     val getLong = "Platform.getLong"
     val putLong = "Platform.putLong"
 
-    val bitset1Words = (schema1.size + 63) / 64
-    val bitset2Words = (schema2.size + 63) / 64
-    val outputBitsetWords = (schema1.size + schema2.size + 63) / 64
-    val bitset1Remainder = schema1.size % 64
+    // Calculate the number of 64-bit words needed for null bit sets
+    // Each word can hold null bits for up to 64 columns
+    val bitset1Words = (schema1.size + 63) / 64 // Number of 8-byte words for row1's bitset
+    val bitset2Words = (schema2.size + 63) / 64 // Number of 8-byte words for row2's bitset
+    val outputBitsetWords = (schema1.size + schema2.size + 63) / 64 // Words needed for combined bitset
+    val bitset1Remainder = schema1.size % 64 // How many bits of the last word in row1's bitset are used
 
-    // The number of bytes we can reduce when we concat two rows together.
-    // The only reduction comes from merging the bitset portion of the two rows, saving 1 word.
+    // Calculate memory savings from combining two bitsets into one.
+    // When two rows are stored separately, their bitsets may have unused padding bits.
+    // By combining them, we can potentially save one 8-byte word.
+    // Example: If row1 has 65 columns (2 words, 63 bits unused) and row2 has 1 column (1 word, 63 bits unused),
+    //          combined they need only 2 words instead of 3, saving 8 bytes.
     val sizeReduction = (bitset1Words + bitset2Words - outputBitsetWords) * 8
 
-    // --------------------- copy bitset from row 1 and row 2 --------------------------- //
+    // =====================================================================================
+    // STEP 1: Generate code to copy and merge the null bit sets from both rows
+    // =====================================================================================
+    //
+    // The null bit set tracks which columns are NULL. When joining two rows, we need to
+    // concatenate their bit sets. This is complicated when row1's column count is not
+    // a multiple of 64, because row2's bits need to be shifted to fill in the unused
+    // portion of row1's last word.
+    //
+    // Example with bitset1Remainder = 3 (row1 has 3 columns, row2 has 2 columns):
+    //
+    //   Row1's bitset (1 word):  [bit0, bit1, bit2, 0, 0, 0, ..., 0]  (61 unused bits)
+    //   Row2's bitset (1 word):  [bit0, bit1, 0, 0, ..., 0]          (62 unused bits)
+    //
+    //   Combined output (1 word): [r1.bit0, r1.bit1, r1.bit2, r2.bit0, r2.bit1, 0, ..., 0]
+    //
+    // The bit shifting handles this merging correctly.
     val copyBitset = Seq.tabulate(outputBitsetWords) { i =>
       val bits = if (bitset1Remainder > 0 && bitset2Words != 0) {
+        // Non-aligned case: row1's column count is not a multiple of 64
         if (i < bitset1Words - 1) {
+          // Copy row1's bitset words directly (except the last one)
           s"$getLong(obj1, offset1 + ${i * 8})"
         } else if (i == bitset1Words - 1) {
-          // combine last work of bitset1 and first word of bitset2
+          // Merge row1's last word with row2's first word (shifted left)
+          // row1's bits occupy the lower positions, row2's bits are shifted to fill the gap
           s"$getLong(obj1, offset1 + ${i * 8}) | ($getLong(obj2, offset2) << $bitset1Remainder)"
         } else if (i - bitset1Words < bitset2Words - 1) {
-          // combine next two words of bitset2
+          // Middle words of row2: need to combine parts from two consecutive words
+          // Lower bits come from the previous word (shifted right), upper bits from current word (shifted left)
           s"($getLong(obj2, offset2 + ${(i - bitset1Words) * 8}) >>> (64 - $bitset1Remainder))" +
             s" | ($getLong(obj2, offset2 + ${(i - bitset1Words + 1) * 8}) << $bitset1Remainder)"
         } else {
-          // last word of bitset2
+          // Last word of row2: only need the remaining bits shifted right
           s"$getLong(obj2, offset2 + ${(i - bitset1Words) * 8}) >>> (64 - $bitset1Remainder)"
         }
       } else {
-        // they are aligned by word
+        // Aligned case: row1's column count is a multiple of 64, or row2 is empty
+        // No bit shifting needed - just copy words directly
         if (i < bitset1Words) {
           s"$getLong(obj1, offset1 + ${i * 8})"
         } else {
@@ -96,6 +209,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
       s"$putLong(null, buf + ${i * 8}, $bits);\n"
     }
 
+    // Split the bitset copying code into multiple methods if it's too large
+    // (Spark's CodeGenerator requires methods to stay under JVM bytecode limits)
     val copyBitsets = ctx.splitExpressions(
       expressions = copyBitset,
       funcName = "copyBitsetFunc",
@@ -103,10 +218,18 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
         ("java.lang.Object", "obj2") :: ("long", "offset2") :: Nil
     )
 
-    // --------------------- copy fixed length portion from row 1 ----------------------- //
+    // =====================================================================================
+    // STEP 2: Generate code to copy fixed-length data from both rows
+    // =====================================================================================
+    //
+    // Fixed-length section contains 8 bytes per column:
+    // - For primitive types (int, long, double, etc.): the actual value
+    // - For variable-length types (string, array, etc.): offset (32 bits) | size (32 bits)
+    //
+    // cursor tracks the current write position in the output buffer
     var cursor = offset + outputBitsetWords * 8
     val copyFixedLengthRow1 = s"""
-                                 |// Copy fixed length data for row1
+                                 |// Copy fixed length data for row1 (${schema1.size} columns * 8 bytes)
                                  |Platform.copyMemory(
                                  |  obj1, offset1 + ${bitset1Words * 8},
                                  |  null, buf + $cursor,
@@ -114,9 +237,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
      """.stripMargin
     cursor += schema1.size * 8
 
-    // --------------------- copy fixed length portion from row 2 ----------------------- //
     val copyFixedLengthRow2 = s"""
-                                 |// Copy fixed length data for row2
+                                 |// Copy fixed length data for row2 (${schema2.size} columns * 8 bytes)
                                  |Platform.copyMemory(
                                  |  obj2, offset2 + ${bitset2Words * 8},
                                  |  null, buf + $cursor,
@@ -124,10 +246,18 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
      """.stripMargin
     cursor += schema2.size * 8
 
-    // --------------------- copy variable length portion from row 1 ----------------------- //
+    // =====================================================================================
+    // STEP 3: Generate code to copy variable-length data from both rows
+    // =====================================================================================
+    //
+    // Variable-length data (strings, arrays, maps, structs) is stored after the fixed-length
+    // section. The size is calculated as: totalRowSize - (bitsetSize + fixedLengthSize)
+    //
+    // Row1's variable data is copied first, then row2's variable data is appended.
     val numBytesBitsetAndFixedRow1 = (bitset1Words + schema1.size) * 8
     val copyVariableLengthRow1 = s"""
                                     |// Copy variable length data for row1
+                                    |// Calculate size: total row bytes - (bitset bytes + fixed length bytes)
                                     |long numBytesVariableRow1 = row1.getSizeInBytes() - $numBytesBitsetAndFixedRow1;
                                     |Platform.copyMemory(
                                     |  obj1, offset1 + ${(bitset1Words + schema1.size) * 8},
@@ -135,10 +265,9 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
                                     |  numBytesVariableRow1);
      """.stripMargin
 
-    // --------------------- copy variable length portion from row 2 ----------------------- //
     val numBytesBitsetAndFixedRow2 = (bitset2Words + schema2.size) * 8
     val copyVariableLengthRow2 = s"""
-                                    |// Copy variable length data for row2
+                                    |// Copy variable length data for row2 (appended after row1's variable data)
                                     |long numBytesVariableRow2 = row2.getSizeInBytes() - $numBytesBitsetAndFixedRow2;
                                     |Platform.copyMemory(
                                     |  obj2, offset2 + ${(bitset2Words + schema2.size) * 8},
@@ -146,114 +275,142 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
                                     |  numBytesVariableRow2);
      """.stripMargin
 
-    // ------------- update fixed length data for variable length data type  --------------- //
+    // =====================================================================================
+    // STEP 4: Generate code to update offsets for variable-length columns
+    // =====================================================================================
+    //
+    // This is the most complex part. For variable-length columns (strings, arrays, etc.),
+    // the fixed-length section stores: [offset (upper 32 bits) | size (lower 32 bits)]
+    //
+    // The offset is the byte position from the start of the UnsafeRow where the actual
+    // data is stored. When we concatenate two rows, these offsets become invalid because:
+    //
+    // 1. The bitset size may have changed (due to merging)
+    // 2. Row2's variable data is now after row1's variable data
+    //
+    // For columns from row1:
+    //   newOffset = oldOffset + (outputBitsetWords - bitset1Words + schema2.size) * 8
+    //   This accounts for: bitset size change + row2's fixed-length section inserted before
+    //
+    // For columns from row2:
+    //   newOffset = oldOffset + (outputBitsetWords - bitset2Words + schema1.size) * 8 + row1VariableDataSize
+    //   This accounts for: bitset size change + row1's fixed-length section + row1's variable data
+    //
     val updateOffset = (schema1 ++ schema2).zipWithIndex.map { case (field, i) =>
       // Skip fixed length data types, and only generate code for variable length data
       if (UnsafeRow.isFixedLength(field.dataType)) {
         ""
       } else {
-        // Number of bytes to increase for the offset. Note that since in UnsafeRow we store the
-        // offset in the upper 32 bit of the words, we can just shift the offset to the left by
-        // 32 and increment that amount in place. However, we need to handle the important special
-        // case of a null field, in which case the offset should be zero and should not have a
-        // shift added to it.
+        // Calculate the shift amount for this column's offset
+        // The offset is stored in the upper 32 bits, so we shift left by 32 when adding
         val shift =
           if (i < schema1.size) {
+            // Column from row1: shift accounts for bitset change and row2's fixed-length section
             s"${(outputBitsetWords - bitset1Words + schema2.size) * 8}L"
           } else {
+            // Column from row2: also need to account for row1's variable-length data
             s"(${(outputBitsetWords - bitset2Words + schema1.size) * 8}L + numBytesVariableRow1)"
           }
         val cursor = offset + outputBitsetWords * 8 + i * 8
-        // UnsafeRow is a little underspecified, so in what follows we'll treat UnsafeRowWriter's
-        // output as a de-facto specification for the internal layout of data.
+
+        // IMPORTANT: Handling NULL values
         //
-        // Null-valued fields will always have a data offset of 0 because
-        // UnsafeRowWriter.setNullAt(ordinal) sets the null bit and stores 0 to in field's
-        // position in the fixed-length section of the row. As a result, we must NOT add
-        // `shift` to the offset for null fields.
+        // UnsafeRow stores offset=0 for NULL variable-length fields. We must NOT add the shift
+        // to NULL fields, otherwise we'd create an invalid non-zero offset.
         //
-        // We could perform a null-check here by inspecting the null-tracking bitmap, but doing
-        // so could be expensive and will add significant bloat to the generated code. Instead,
-        // we'll rely on the invariant "stored offset == 0 for variable-length data type implies
-        // that the field's value is null."
+        // We detect NULL fields by checking if existingOffset == 0. This works because:
         //
-        // To establish that this invariant holds, we'll prove that a non-null field can never
-        // have a stored offset of 0. There are two cases to consider:
+        // 1. For non-NULL fields with data: offset is always non-zero (points past the fixed section)
+        // 2. For non-NULL empty strings/arrays: UnsafeRowWriter still stores a valid non-zero offset
+        //    (the position where data would be, even though the size is 0)
+        // 3. For NULL fields: offset is explicitly set to 0 by UnsafeRowWriter.setNullAt()
         //
-        //   1. The non-null field's data is of non-zero length: reading this field's value
-        //      must read data from the variable-length section of the row, so the stored offset
-        //      will actually be used in address calculation and must be correct. The offsets
-        //      count bytes from the start of the UnsafeRow so these offsets will always be
-        //      non-zero because the storage of the offsets themselves takes up space at the
-        //      start of the row.
-        //   2. The non-null field's data is of zero length (i.e. its data is empty). In this
-        //      case, we have to worry about the possibility that an arbitrary offset value was
-        //      stored because we never actually read any bytes using this offset and therefore
-        //      would not crash if it was incorrect. The variable-sized data writing paths in
-        //      UnsafeRowWriter unconditionally calls setOffsetAndSize(ordinal, numBytes) with
-        //      no special handling for the case where `numBytes == 0`. Internally,
-        //      setOffsetAndSize computes the offset without taking the size into account. Thus
-        //      the stored offset is the same non-zero offset that would be used if the field's
-        //      dataSize was non-zero (and in (1) above we've shown that case behaves as we
-        //      expect).
-        //
-        // Thus it is safe to perform `existingOffset != 0` checks here in the place of
-        // more expensive null-bit checks.
+        // This "offset == 0 means NULL" check is faster than reading the null bitmap.
+        // Because UnsafeRowWriter.setNullAt() sets offset=0 and size=0 for NULLs,
+        // we can rely on this property safely.
         s"""
            |existingOffset = $getLong(null, buf + $cursor);
            |if (existingOffset != 0) {
+           |    // Add shift to upper 32 bits (offset) while preserving lower 32 bits (size)
            |    $putLong(null, buf + $cursor, existingOffset + ($shift << 32));
            |}
          """.stripMargin
       }
     }
 
+    // Split the offset update code into multiple methods if needed
     val updateOffsets = ctx.splitExpressions(
       expressions = updateOffset,
-      funcName = "copyBitsetFunc",
+      funcName = "copyBitsetFunc", // Note: function name reuse is intentional (Spark codegen quirk)
       arguments = ("long", "numBytesVariableRow1") :: Nil,
       makeSplitFunction = (s: String) => "long existingOffset;\n" + s
     )
 
-    // ------------------------ Finally, put everything together  --------------------------- //
+    // =====================================================================================
+    // STEP 5: Assemble the final generated code
+    // =====================================================================================
+    //
+    // The generated class has this structure:
+    // - A reusable UnsafeRow instance for output (avoids allocation per join)
+    // - Helper methods for bitset copying and offset updates (if code was split)
+    // - The main join() method that orchestrates all the steps
+    //
+    // The join() method:
+    // 1. Calculates the output size: row1.size + row2.size - sizeReduction
+    // 2. Gets base object and offset for both input rows
+    // 3. Copies bitsets, fixed-length data, and variable-length data
+    // 4. Updates offsets for variable-length columns
+    // 5. Points the output UnsafeRow to the buffer and returns it
     val codeBody = s"""
-                      |public java.lang.Object generate(Object[] references) {
-                      |  return new SpecificUnsafeRowJoiner();
-                      |}
-                      |
+       |public java.lang.Object generate(Object[] references) {
+       |  return new SpecificUnsafeRowJoiner();
+       |}
+       |
        |class SpecificUnsafeRowJoiner extends ${classOf[CustomUnsafeRowJoiner].getName} {
-                      |  private UnsafeRow out = new UnsafeRow(${schema1.size + schema2.size});
-                      |
+       |  // Reusable output row to avoid allocation overhead during repeated joins
+       |  private UnsafeRow out = new UnsafeRow(${schema1.size + schema2.size});
+       |
        |  ${ctx.declareAddedFunctions()}
-                      |
+       |
        |  public UnsafeRow join(UnsafeRow row1, UnsafeRow row2, long buf) {
-                      |    // row1: ${schema1.size} fields, $bitset1Words words in bitset
-                      |    // row2: ${schema2.size}, $bitset2Words words in bitset
-                      |    // output: ${schema1.size + schema2.size} fields, $outputBitsetWords words in bitset
-                      |    final int sizeInBytes = row1.getSizeInBytes() + row2.getSizeInBytes() - $sizeReduction;
-                      |
-       |    final java.lang.Object obj1 = row1.getBaseObject();
-                      |    final long offset1 = row1.getBaseOffset();
-                      |    final java.lang.Object obj2 = row2.getBaseObject();
-                      |    final long offset2 = row2.getBaseOffset();
-                      |
+       |    // Schema information for debugging:
+       |    // row1: ${schema1.size} fields, $bitset1Words words in bitset
+       |    // row2: ${schema2.size} fields, $bitset2Words words in bitset
+       |    // output: ${schema1.size + schema2.size} fields, $outputBitsetWords words in bitset
+       |
+       |    // Calculate output size: sum of both rows minus bytes saved by merging bitsets
+       |    final int sizeInBytes = row1.getSizeInBytes() + row2.getSizeInBytes() - $sizeReduction;
+       |
+       |    // Get memory locations of input rows
+       |    final java.lang.Object obj1 = row1.getBaseObject();  // null for off-heap
+       |    final long offset1 = row1.getBaseOffset();           // memory address
+       |    final java.lang.Object obj2 = row2.getBaseObject();
+       |    final long offset2 = row2.getBaseOffset();
+       |
+       |    // Step 1: Copy and merge null bitsets
        |    $copyBitsets
-                      |    $copyFixedLengthRow1
-                      |    $copyFixedLengthRow2
-                      |    $copyVariableLengthRow1
-                      |    $copyVariableLengthRow2
-                      |    long existingOffset;
-                      |    $updateOffsets
-                      |
+       |    // Step 2: Copy fixed-length sections
+       |    $copyFixedLengthRow1
+       |    $copyFixedLengthRow2
+       |    // Step 3: Copy variable-length data
+       |    $copyVariableLengthRow1
+       |    $copyVariableLengthRow2
+       |    // Step 4: Update offsets for variable-length columns
+       |    long existingOffset;
+       |    $updateOffsets
+       |
+       |    // Point output row to the buffer containing concatenated data
        |    out.pointTo(null, buf, sizeInBytes);
-                      |
+       |
        |    return out;
-                      |  }
-                      |}
+       |  }
+       |}
      """.stripMargin
+    // Format and compile the generated code
     val code = CodeFormatter.stripOverlappingComments(new CodeAndComment(codeBody, Map.empty))
     logDebug(s"SpecificUnsafeRowJoiner($schema1, $schema2):\n${CodeFormatter.format(code)}")
 
+    // Compile the code and create an instance of the generated class
     val (clazz, _) = CodeGenerator.compile(code)
     clazz.generate(Array.empty).asInstanceOf[CustomUnsafeRowJoiner]
   }
