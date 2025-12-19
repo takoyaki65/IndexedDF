@@ -127,8 +127,7 @@ class RowBatch implements AutoCloseable {
      */
     public int appendRow(byte[] crntRow) {
         // Copy from Java heap (byte array) to off-heap memory
-        // Platform.BOOLEAN_ARRAY_OFFSET is used as the base offset for byte arrays
-        Platform.copyMemory(crntRow, Platform.BOOLEAN_ARRAY_OFFSET, null, rowData + size, crntRow.length);
+        Platform.copyMemory(crntRow, Platform.BYTE_ARRAY_OFFSET, null, rowData + size, crntRow.length);
 
         int returnedOffset = size;
         lastOffset = size;
