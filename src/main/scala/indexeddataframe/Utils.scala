@@ -1,6 +1,6 @@
 package indexeddataframe
 
-import indexeddataframe.InternalIndexedDF
+import indexeddataframe.InternalIndexedPartition
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
@@ -19,16 +19,16 @@ object Utils {
   val defaultPartitioner: HashPartitioner = new HashPartitioner(defaultNoPartitions)
 
   /** function that is executed when the index is created on a DataFrame this function is called for each partition of the original DataFrame and it
-    * creates an [[InternalIndexedDF]] that contains the rows of the partitions and a CTrie for storing an index
+    * creates an [[InternalIndexedPartition]] that contains the rows of the partitions and a CTrie for storing an index
     * @param colNo
     * @param rows
-    * @param types
+    * @param output
     * @return
     */
-  def doIndexing(colNo: Int, rows: Iterator[InternalRow], types: Seq[DataType], output: Seq[Attribute]): InternalIndexedDF = {
-    val idf = new InternalIndexedDF
+  def doIndexing(colNo: Int, rows: Iterator[InternalRow], output: Seq[Attribute]): InternalIndexedPartition = {
+    val idf = new InternalIndexedPartition
     idf.initialize()
-    idf.createIndex(types, output, colNo)
+    idf.createIndex(output, colNo)
     idf.appendRows(rows)
     /*
     val meter = new MemoryMeter()
@@ -84,11 +84,11 @@ object Utils {
 }
 
 /** a custom RDD class that is composed of a number of partitions containing the rows of the indexed dataframe; each of these partitions is
-  * represented as an [[InternalIndexedDF]]
+  * represented as an [[InternalIndexedPartition]]
   * @param colNo
   * @param partitionsRDD
   */
-class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedDF])
+class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedPartition])
     extends RDD[InternalRow](partitionsRDD.context, List(new OneToOneDependency(partitionsRDD))) {
 
   override val partitioner = partitionsRDD.partitioner
@@ -96,7 +96,7 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedDF])
   override protected def getPartitions: Array[Partition] = partitionsRDD.partitions
 
   override def compute(part: Partition, context: TaskContext): Iterator[InternalRow] = {
-    firstParent[InternalIndexedDF].iterator(part, context).next.iterator
+    firstParent[InternalIndexedPartition].iterator(part, context).next.iterator
   }
 
   override def persist(newLevel: StorageLevel): this.type = {

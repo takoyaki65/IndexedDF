@@ -4,7 +4,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, EqualTo, Expression, Literal}
-import indexeddataframe.{IRDD, InternalIndexedDF, Utils}
+import indexeddataframe.{IRDD, InternalIndexedPartition, Utils}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
@@ -93,7 +93,7 @@ case class CreateIndexExec(override val indexColNo: Int, child: SparkPlan) exten
     // create the index
     val partitions = child
       .execute()
-      .mapPartitions[InternalIndexedDF](rowIter => Iterator(Utils.doIndexing(indexColNo, rowIter, output.map(_.dataType), output)), true)
+      .mapPartitions[InternalIndexedPartition](rowIter => Iterator(Utils.doIndexing(indexColNo, rowIter, output)), true)
     val ret = new IRDD(indexColNo, partitions)
     Utils.ensureCached(ret)
   }

@@ -7,7 +7,7 @@ import org.apache.spark.unsafe.Platform;
  *
  * <h2>Overview</h2>
  * RowBatch is a container that stores multiple UnsafeRow byte representations
- * in a contiguous off-heap memory region. It is used by InternalIndexedDF to
+ * in a contiguous off-heap memory region. It is used by InternalIndexedPartition to
  * store the actual row data, while the index (TrieMap) stores pointers to
  * rows within these batches.
  *
@@ -48,7 +48,7 @@ import org.apache.spark.unsafe.Platform;
  *   <li>Serialization will NOT preserve the actual memory contents</li>
  * </ul>
  *
- * @see InternalIndexedDF
+ * @see InternalIndexedPartition
  * @see CustomUnsafeRowJoiner
  */
 class RowBatch implements AutoCloseable {

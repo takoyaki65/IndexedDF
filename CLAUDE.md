@@ -38,7 +38,7 @@ src/main/
 │   └── RowBatch.java             # オフヒープメモリ管理（行データ格納）
 └── scala/
     ├── indexeddataframe/
-    │   ├── InternalIndexedDF.scala   # インデックス付きパーティションのコアデータ構造
+    │   ├── InternalIndexedPartition.scala   # インデックス付きパーティションのコアデータ構造
     │   ├── Utils.scala               # ユーティリティとIRDD（カスタムRDD）
     │   ├── implicits.scala           # Dataset拡張のimplicit変換
     │   ├── strategies.scala          # Catalyst物理プランへの変換戦略
@@ -59,12 +59,12 @@ src/main/
   - GCの影響を受けず、大量データでも安定したパフォーマンス
   - `Platform.copyMemory()`による高速なメモリ操作
 
-- **InternalIndexedDF**: パーティション単位のインデックス付きデータ構造
+- **InternalIndexedPartition**: パーティション単位のインデックス付きデータ構造
   - `TrieMap[Long, Long]`: キー → 行ポインタのインデックス（CTrie）
   - `TrieMap[Int, RowBatch]`: 行データを格納するバッチ
   - 64bit整数にバッチNo、オフセット、サイズをパック
 
-- **IRDD**: `RDD[InternalIndexedDF]`のラッパー。`get`/`multiget`メソッドを提供
+- **IRDD**: `RDD[InternalIndexedPartition]`のラッパー。`get`/`multiget`メソッドを提供
 
 ### Catalyst統合
 
