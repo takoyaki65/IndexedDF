@@ -18,30 +18,28 @@ object InternalIndexedPartition {
   // Bit packing configuration for 64-bit row pointers
   // =====================================================================================
   //
-  // The pointer layout divides a 64-bit integer into three fields:
-  //   - Batch number: identifies which RowBatch contains the row
-  //   - Offset: byte offset within the RowBatch
-  //   - Size: size of the row in bytes
+  // The pointer layout divides a 64-bit integer into two fields:
+  //   - Batch number: identifies which RowBatch contains the row (upper 32 bits)
+  //   - Offset: byte offset within the RowBatch (lower 32 bits)
+  //
+  // Row size is stored inline at the beginning of each row data (4-byte header).
   //
   // Current configuration:
-  //   - 24 bits for batch number → up to 16 million batches
-  //   - 24 bits for offset → up to 16MB per batch (only 4MB used)
-  //   - 16 bits for row size → up to 64KB per row
+  //   - 32 bits for batch number → up to ~4 billion batches
+  //   - 32 bits for offset → up to 4GB per batch (128MB used by default)
+  //   - Row size stored as 4-byte (32-bit) header → up to ~2GB per row
 
-  /** Number of bits to represent the batch number (supports up to 16M batches) */
-  final val NoBitsBatches: Int = 24
+  /** Number of bits to represent the batch number (upper 32 bits) */
+  final val NoBitsBatches: Int = 32
 
-  /** Number of bits to represent the offset within a batch (supports up to 16MB offsets) */
-  final val NoBitsOffsets: Int = 24
+  /** Number of bits to represent the offset within a batch (lower 32 bits) */
+  final val NoBitsOffsets: Int = 32
 
-  /** Total bits in the pointer (always 64) */
-  final val NoTotalBits: Int = 64
+  /** Size header bytes prepended to each row (stores row size as 4-byte int) */
+  final val RowSizeHeaderBytes: Int = 4
 
-  /** Number of bits for row size = 64 - 24 - 24 = 16 bits (supports up to 64KB rows) */
-  final val NoRowSizeBits: Int = NoTotalBits - NoBitsOffsets - NoBitsBatches
-
-  /** RowBatch size: 4MB per batch */
-  final val BatchSize: Int = 4 * 1024 * 1024
+  /** RowBatch size: 128MB per batch (aligned with Spark's default partition size) */
+  final val BatchSize: Int = 128 * 1024 * 1024
 }
 
 /**
@@ -79,11 +77,18 @@ object InternalIndexedPartition {
  *
  * {{{
  *   64-bit pointer layout:
- *   ┌──────────────────┬──────────────────┬──────────────────┐
- *   │ Batch No (24bit) │  Offset (24bit)  │  Size (16bit)    │
- *   │  (up to 16M)     │  (up to 16MB)    │  (up to 64KB)    │
- *   └──────────────────┴──────────────────┴──────────────────┘
- *   MSB                                                   LSB
+ *   ┌─────────────────────────┬─────────────────────────┐
+ *   │    Batch No (32bit)     │     Offset (32bit)      │
+ *   │   (up to ~4 billion)    │     (up to 4GB)         │
+ *   └─────────────────────────┴─────────────────────────┘
+ *   MSB                                              LSB
+ *
+ *   Row data layout in RowBatch:
+ *   ┌──────────────┬─────────────────────────────────────┐
+ *   │ Size (4byte) │           Row Data (N bytes)        │
+ *   └──────────────┴─────────────────────────────────────┘
+ *
+ *   This design supports rows up to ~2GB (Integer.MAX_VALUE bytes).
  * }}}
  *
  * == Duplicate Key Handling ==
@@ -258,45 +263,56 @@ class InternalIndexedPartition {
   // =====================================================================================
 
   /**
-   * Packs batch number, offset, and size into a single 64-bit pointer.
+   * Packs batch number and offset into a single 64-bit pointer.
    *
    * Layout (from MSB to LSB):
    * {{{
-   *   [batchNo: 24 bits][offset: 24 bits][size: 16 bits]
+   *   [batchNo: 32 bits][offset: 32 bits]
    * }}}
    *
-   * @param batchNo The RowBatch ID (0 to 16M-1)
-   * @param offset  Byte offset within the RowBatch (0 to 16M-1)
-   * @param size    Row size in bytes (0 to 64K-1)
+   * Note: Row size is no longer packed into the pointer. Instead, it is stored
+   * as a 4-byte header at the beginning of each row in the RowBatch.
+   *
+   * @param batchNo The RowBatch ID (0 to ~4 billion)
+   * @param offset  Byte offset within the RowBatch (0 to ~4 billion)
    * @return A packed 64-bit pointer
    */
-  private def packBatchRowIdOffset(batchNo: Integer, offset: Integer, size: Integer): Long = {
-    var result: Long = 0
-    // Place batchNo in the upper 24 bits
-    result = batchNo.toLong << (NoTotalBits - NoBitsBatches)
-    // Place offset in the middle 24 bits
-    result = result | (offset.toLong << NoRowSizeBits)
-    // Place size in the lower 16 bits
-    // TODO: If size exceeds 16 bits, packed value will be incorrect
-    result = result | size
-    result
+  private def packBatchOffset(batchNo: Int, offset: Int): Long = {
+    (batchNo.toLong << NoBitsOffsets) | (offset.toLong & 0xffffffffL)
   }
 
   /**
    * Unpacks a 64-bit pointer into its component parts.
    *
    * @param value The packed 64-bit pointer
-   * @return A tuple of (batchNo, offset, size)
+   * @return A tuple of (batchNo, offset)
    */
-  private def unpackBatchRowIdOffset(value: Long): (Int, Int, Int) = {
-    // Extract batchNo from upper 24 bits
-    val batchNo = (value >>> (NoTotalBits - NoBitsBatches)).toInt
-    // Extract offset from middle 24 bits (shift left to clear batchNo, then right to position)
-    val offset = (((value << NoBitsBatches) >>> NoBitsBatches) >>> NoRowSizeBits).toInt
-    // Extract size from lower 16 bits
-    val size = ((value << (NoTotalBits - NoRowSizeBits)) >>> (NoTotalBits - NoRowSizeBits)).toInt
+  private def unpackBatchOffset(value: Long): (Int, Int) = {
+    val batchNo = (value >>> NoBitsOffsets).toInt
+    val offset = value.toInt // Lower 32 bits
+    (batchNo, offset)
+  }
 
-    (batchNo, offset, size)
+  /**
+   * Reads the row size from the 4-byte header at the given memory location.
+   *
+   * @param baseAddress Base address of the RowBatch
+   * @param offset      Offset within the RowBatch where the size header starts
+   * @return The row size in bytes
+   */
+  private def readRowSizeHeader(baseAddress: Long, offset: Int): Int = {
+    Platform.getInt(null, baseAddress + offset)
+  }
+
+  /**
+   * Writes the row size to the 4-byte header at the given memory location.
+   *
+   * @param baseAddress Base address of the RowBatch
+   * @param offset      Offset within the RowBatch where the size header starts
+   * @param size        The row size in bytes
+   */
+  private def writeRowSizeHeader(baseAddress: Long, offset: Int, size: Int): Unit = {
+    Platform.putInt(null, baseAddress + offset, size)
   }
 
   // =====================================================================================
@@ -364,8 +380,15 @@ class InternalIndexedPartition {
    * This method performs the following steps:
    * 1. Extracts the key from the index column (converting to Long if needed)
    * 2. Creates a #prev row containing a placeholder for the backward pointer
-   * 3. Joins the original row with #prev and writes to off-heap memory
+   * 3. Writes the 4-byte size header, then joins the row with #prev to off-heap memory
    * 4. Updates the index, linking to any existing rows with the same key
+   *
+   * Memory layout for each row:
+   * {{{
+   *   ┌──────────────┬─────────────────────────────────────┐
+   *   │ Size (4byte) │   Row Data (original + #prev col)   │
+   *   └──────────────┴─────────────────────────────────────┘
+   * }}}
    *
    * Duplicate key handling:
    * - If a row with the same key already exists, the new row's #prev pointer
@@ -375,11 +398,6 @@ class InternalIndexedPartition {
    * @param row The row to append (InternalRow, will be converted to UnsafeRow if needed)
    */
   def appendRow(row: InternalRow): Unit = {
-    // // Convert to UnsafeRow if necessary (most Spark operators already produce UnsafeRow)
-    // val unsafeRow = row match {
-    //   case ur: UnsafeRow => ur
-    //   case _             => convertToUnsafe(row)
-    // }
     // NOTE: Assume input rows are always UnsafeRow for performance
     val unsafeRow = row.asInstanceOf[UnsafeRow]
 
@@ -397,19 +415,30 @@ class InternalIndexedPartition {
     for (i <- 0 to 7) prevByteArray(i) = 0
     prevRow.pointTo(prevByteArray, 16)
 
-    // Get a batch with enough space for the row + 8 bytes for #prev
-    val crntBatch = getBatchForRowSize(unsafeRow.getSizeInBytes + 8)
+    // Calculate total size needed: 4-byte size header + row data + 8 bytes for #prev
+    val estimatedRowSize = unsafeRow.getSizeInBytes + 8 // row + #prev column
+    val totalSizeNeeded = RowSizeHeaderBytes + estimatedRowSize
+
+    // Get a batch with enough space
+    val crntBatch = getBatchForRowSize(totalSizeNeeded)
     val offset = crntBatch.getCurrentOffset()
     val ptr = crntBatch.getCurrentPointer()
 
+    // Reserve space for size header (write row data after the header)
+    val rowDataOffset = offset + RowSizeHeaderBytes
+
     // Join the row with #prev column, writing directly to off-heap memory
     var t1 = System.nanoTime()
-    val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, ptr + offset)
+    val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, ptr + rowDataOffset)
     var t2 = System.nanoTime()
     totalProjections += (t2 - t1)
 
-    // Create packed pointer to this row's location
-    val cTriePointer = packBatchRowIdOffset(nRowBatches - 1, offset, resultRow.getSizeInBytes)
+    // Write the size header at the beginning
+    val rowSize = resultRow.getSizeInBytes
+    writeRowSizeHeader(ptr, offset, rowSize)
+
+    // Create packed pointer to this row's location (points to size header)
+    val cTriePointer = packBatchOffset(nRowBatches - 1, offset)
 
     // Handle duplicate keys by linking to existing row
     val existingPointer = index.get(key)
@@ -424,9 +453,9 @@ class InternalIndexedPartition {
     // Update index to point to this (newest) row
     this.index.put(key, cTriePointer)
 
-    // Finalize the row in the batch
+    // Finalize the row in the batch (size header + row data)
     t1 = System.nanoTime()
-    crntBatch.updateAppendedRowSize(resultRow.getSizeInBytes)
+    crntBatch.updateAppendedRowSize(RowSizeHeaderBytes + rowSize)
     t2 = System.nanoTime()
     totalAppend += (t2 - t1)
 
@@ -463,6 +492,15 @@ class InternalIndexedPartition {
    *   index[key] ──▶ row3 ──▶ row2 ──▶ row1 ──▶ END (0xFF..FF)
    * }}}
    *
+   * Memory layout for each row:
+   * {{{
+   *   ┌──────────────┬─────────────────────────────────────┐
+   *   │ Size (4byte) │   Row Data (original + #prev col)   │
+   *   └──────────────┴─────────────────────────────────────┘
+   *   ^               ^
+   *   offset          offset + 4 (row data starts here)
+   * }}}
+   *
    * @param rowPointer Initial packed pointer from the index
    */
   class RowIterator(rowPointer: Long) extends Iterator[InternalRow] {
@@ -477,8 +515,8 @@ class InternalIndexedPartition {
     }
 
     def next(): InternalRow = {
-      // Unpack pointer to get row location
-      val (batchNo, offset, size) = unpackBatchRowIdOffset(crntRowPointer)
+      // Unpack pointer to get batch number and offset
+      val (batchNo, offset) = unpackBatchOffset(crntRowPointer)
 
       // Retrieve the RowBatch
       val batchOpt = rowBatches.get(batchNo)
@@ -491,8 +529,14 @@ class InternalIndexedPartition {
         )
       }
 
-      // Point to the row data in off-heap memory
-      currentRow.pointTo(null, batchOpt.get.rowData + offset, size)
+      val baseAddress = batchOpt.get.rowData
+
+      // Read the row size from the 4-byte header
+      val size = readRowSizeHeader(baseAddress, offset)
+
+      // Point to the row data (after the size header)
+      val rowDataOffset = offset + RowSizeHeaderBytes
+      currentRow.pointTo(null, baseAddress + rowDataOffset, size)
 
       // Follow the backward pointer to the next row with the same key
       crntRowPointer = currentRow.getLong(nColumns)

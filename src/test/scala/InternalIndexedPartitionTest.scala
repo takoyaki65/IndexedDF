@@ -438,8 +438,9 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
     ))
 
     // Create rows with large strings to fill batches
-    val largeValue = "x" * 10000 // 10KB per row
-    val numRows = 500 // Should require multiple 4MB batches
+    // BatchSize is 128MB, so we need enough data to exceed that
+    val largeValue = "x" * 100000 // 100KB per row
+    val numRows = 2000 // ~200MB total, should require multiple 128MB batches
 
     for (i <- 1 to numRows) {
       partition.appendRow(createUnsafeRow(schema, i, largeValue))
