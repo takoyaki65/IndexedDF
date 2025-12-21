@@ -197,9 +197,11 @@ class InternalIndexedPartition {
    * Creates a new RowBatch and adds it to the rowBatches map.
    *
    * Called during initialization and when the current batch is full.
+   * 
+   * @param batchSize Size of the new RowBatch in bytes
    */
-  private def createRowBatch(): Unit = {
-    rowBatches.put(nRowBatches, new RowBatch(BatchSize))
+  private def createRowBatch(batchSize: Int): Unit = {
+    rowBatches.put(nRowBatches, new RowBatch(batchSize))
     nRowBatches += 1
   }
 
@@ -214,7 +216,13 @@ class InternalIndexedPartition {
   private def getBatchForRowSize(size: Int): RowBatch = {
     if (!rowBatches.get(nRowBatches - 1).get.canInsert(size)) {
       // Current batch is full, create a new one
-      createRowBatch()
+      if (size > BatchSize) {
+        // Row is larger than default batch size, create a larger batch
+        createRowBatch(size)
+      } else {
+        // Create a standard-sized batch
+        createRowBatch(BatchSize)
+      }
     }
     rowBatches.get(nRowBatches - 1).get
   }
@@ -255,7 +263,7 @@ class InternalIndexedPartition {
     this.convertToUnsafe = UnsafeProjection.create(schema)
 
     // Allocate the first RowBatch
-    createRowBatch()
+    createRowBatch(BatchSize)
   }
 
   // =====================================================================================
@@ -721,7 +729,7 @@ class InternalIndexedPartition {
     // Allocate a new RowBatch for the copy to avoid write conflicts
     // The original's current batch might still be written to
     copy.nRowBatches = this.nRowBatches
-    copy.createRowBatch()
+    copy.createRowBatch(BatchSize)
 
     // Copy metadata
     copy.schema = this.schema
