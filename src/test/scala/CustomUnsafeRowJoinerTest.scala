@@ -7,7 +7,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 /**
  * Test suite for CustomUnsafeRowJoiner - A code generator that joins two UnsafeRows
- * into a single UnsafeRow using an externally provided off-heap memory buffer.
+ * into a single UnsafeRow using an externally provided on-heap memory buffer.
  *
  * These tests verify:
  * - Basic row joining with fixed-length types (Int, Long, Double)
@@ -23,18 +23,11 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
   val testBufferSize: Int = 4096
 
   /**
-   * Helper method to allocate an off-heap buffer for testing.
-   * IMPORTANT: Caller must free this memory after use.
+   * Helper method to allocate an on-heap buffer for testing.
+   * Returns a tuple of (byte array, base offset).
    */
-  private def allocateBuffer(size: Int): Long = {
-    Platform.allocateMemory(size)
-  }
-
-  /**
-   * Helper method to free an off-heap buffer.
-   */
-  private def freeBuffer(buf: Long): Unit = {
-    Platform.freeMemory(buf)
+  private def allocateBuffer(size: Int): (Array[Byte], Long) = {
+    (new Array[Byte](size), Platform.BYTE_ARRAY_OFFSET)
   }
 
   /**
@@ -63,46 +56,42 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, 42)
     val row2 = createUnsafeRow(schema2, 100)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2, "Result should have 2 fields")
-      assert(result.getInt(0) == 42, "First field should be 42")
-      assert(result.getInt(1) == 100, "Second field should be 100")
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2, "Result should have 2 fields")
+    assert(result.getInt(0) == 42, "First field should be 42")
+    assert(result.getInt(1) == 100, "Second field should be 100")
   }
 
   test("join two rows with multiple Int columns") {
-    val schema1 = StructType(Seq(
-      StructField("a1", IntegerType),
-      StructField("a2", IntegerType),
-      StructField("a3", IntegerType)
-    ))
-    val schema2 = StructType(Seq(
-      StructField("b1", IntegerType),
-      StructField("b2", IntegerType)
-    ))
+    val schema1 = StructType(
+      Seq(
+        StructField("a1", IntegerType),
+        StructField("a2", IntegerType),
+        StructField("a3", IntegerType)
+      )
+    )
+    val schema2 = StructType(
+      Seq(
+        StructField("b1", IntegerType),
+        StructField("b2", IntegerType)
+      )
+    )
 
     val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
     val row1 = createUnsafeRow(schema1, 1, 2, 3)
     val row2 = createUnsafeRow(schema2, 4, 5)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 5)
-      assert(result.getInt(0) == 1)
-      assert(result.getInt(1) == 2)
-      assert(result.getInt(2) == 3)
-      assert(result.getInt(3) == 4)
-      assert(result.getInt(4) == 5)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 5)
+    assert(result.getInt(0) == 1)
+    assert(result.getInt(1) == 2)
+    assert(result.getInt(2) == 3)
+    assert(result.getInt(3) == 4)
+    assert(result.getInt(4) == 5)
   }
 
   test("join rows with Long columns") {
@@ -113,16 +102,12 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, 9876543210L)
     val row2 = createUnsafeRow(schema2, 1234567890L)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(result.getLong(0) == 9876543210L)
-      assert(result.getLong(1) == 1234567890L)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(result.getLong(0) == 9876543210L)
+    assert(result.getLong(1) == 1234567890L)
   }
 
   test("join rows with Double columns") {
@@ -133,44 +118,40 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, 3.14159)
     val row2 = createUnsafeRow(schema2, 2.71828)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(math.abs(result.getDouble(0) - 3.14159) < 0.00001)
-      assert(math.abs(result.getDouble(1) - 2.71828) < 0.00001)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(math.abs(result.getDouble(0) - 3.14159) < 0.00001)
+    assert(math.abs(result.getDouble(1) - 2.71828) < 0.00001)
   }
 
   test("join rows with mixed fixed-length types") {
-    val schema1 = StructType(Seq(
-      StructField("intCol", IntegerType),
-      StructField("longCol", LongType)
-    ))
-    val schema2 = StructType(Seq(
-      StructField("doubleCol", DoubleType),
-      StructField("boolCol", BooleanType)
-    ))
+    val schema1 = StructType(
+      Seq(
+        StructField("intCol", IntegerType),
+        StructField("longCol", LongType)
+      )
+    )
+    val schema2 = StructType(
+      Seq(
+        StructField("doubleCol", DoubleType),
+        StructField("boolCol", BooleanType)
+      )
+    )
 
     val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
     val row1 = createUnsafeRow(schema1, 42, 123456789L)
     val row2 = createUnsafeRow(schema2, 9.99, true)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 4)
-      assert(result.getInt(0) == 42)
-      assert(result.getLong(1) == 123456789L)
-      assert(math.abs(result.getDouble(2) - 9.99) < 0.001)
-      assert(result.getBoolean(3) == true)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 4)
+    assert(result.getInt(0) == 42)
+    assert(result.getLong(1) == 123456789L)
+    assert(math.abs(result.getDouble(2) - 9.99) < 0.001)
+    assert(result.getBoolean(3) == true)
   }
 
   // ============================================
@@ -185,44 +166,40 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, "hello")
     val row2 = createUnsafeRow(schema2, "world")
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(result.getUTF8String(0).toString == "hello")
-      assert(result.getUTF8String(1).toString == "world")
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(result.getUTF8String(0).toString == "hello")
+    assert(result.getUTF8String(1).toString == "world")
   }
 
   test("join rows with String and Int columns") {
-    val schema1 = StructType(Seq(
-      StructField("id", IntegerType),
-      StructField("name", StringType)
-    ))
-    val schema2 = StructType(Seq(
-      StructField("value", IntegerType),
-      StructField("description", StringType)
-    ))
+    val schema1 = StructType(
+      Seq(
+        StructField("id", IntegerType),
+        StructField("name", StringType)
+      )
+    )
+    val schema2 = StructType(
+      Seq(
+        StructField("value", IntegerType),
+        StructField("description", StringType)
+      )
+    )
 
     val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
     val row1 = createUnsafeRow(schema1, 1, "Alice")
     val row2 = createUnsafeRow(schema2, 100, "Customer")
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 4)
-      assert(result.getInt(0) == 1)
-      assert(result.getUTF8String(1).toString == "Alice")
-      assert(result.getInt(2) == 100)
-      assert(result.getUTF8String(3).toString == "Customer")
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 4)
+    assert(result.getInt(0) == 1)
+    assert(result.getUTF8String(1).toString == "Alice")
+    assert(result.getInt(2) == 100)
+    assert(result.getUTF8String(3).toString == "Customer")
   }
 
   test("join rows with empty String") {
@@ -233,16 +210,12 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, "")
     val row2 = createUnsafeRow(schema2, "nonempty")
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(result.getUTF8String(0).toString == "")
-      assert(result.getUTF8String(1).toString == "nonempty")
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(result.getUTF8String(0).toString == "")
+    assert(result.getUTF8String(1).toString == "nonempty")
   }
 
   test("join rows with long Strings") {
@@ -255,16 +228,12 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, longString1)
     val row2 = createUnsafeRow(schema2, longString2)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(result.getUTF8String(0).toString == longString1)
-      assert(result.getUTF8String(1).toString == longString2)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(result.getUTF8String(0).toString == longString1)
+    assert(result.getUTF8String(1).toString == longString2)
   }
 
   // ============================================
@@ -279,17 +248,13 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, null)
     val row2 = createUnsafeRow(schema2, 42)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(result.isNullAt(0), "First field should be NULL")
-      assert(!result.isNullAt(1), "Second field should not be NULL")
-      assert(result.getInt(1) == 42)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(result.isNullAt(0), "First field should be NULL")
+    assert(!result.isNullAt(1), "Second field should not be NULL")
+    assert(result.getInt(1) == 42)
   }
 
   test("join rows with NULL String values") {
@@ -300,47 +265,43 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, "hello")
     val row2 = createUnsafeRow(schema2, null)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 2)
-      assert(!result.isNullAt(0))
-      assert(result.getUTF8String(0).toString == "hello")
-      assert(result.isNullAt(1), "Second field should be NULL")
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 2)
+    assert(!result.isNullAt(0))
+    assert(result.getUTF8String(0).toString == "hello")
+    assert(result.isNullAt(1), "Second field should be NULL")
   }
 
   test("join rows with multiple NULL values in different positions") {
-    val schema1 = StructType(Seq(
-      StructField("a1", IntegerType, nullable = true),
-      StructField("a2", StringType, nullable = true),
-      StructField("a3", LongType, nullable = true)
-    ))
-    val schema2 = StructType(Seq(
-      StructField("b1", StringType, nullable = true),
-      StructField("b2", IntegerType, nullable = true)
-    ))
+    val schema1 = StructType(
+      Seq(
+        StructField("a1", IntegerType, nullable = true),
+        StructField("a2", StringType, nullable = true),
+        StructField("a3", LongType, nullable = true)
+      )
+    )
+    val schema2 = StructType(
+      Seq(
+        StructField("b1", StringType, nullable = true),
+        StructField("b2", IntegerType, nullable = true)
+      )
+    )
 
     val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
     val row1 = createUnsafeRow(schema1, null, "test", null)
     val row2 = createUnsafeRow(schema2, null, 99)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 5)
-      assert(result.isNullAt(0))
-      assert(result.getUTF8String(1).toString == "test")
-      assert(result.isNullAt(2))
-      assert(result.isNullAt(3))
-      assert(result.getInt(4) == 99)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 5)
+    assert(result.isNullAt(0))
+    assert(result.getUTF8String(1).toString == "test")
+    assert(result.isNullAt(2))
+    assert(result.isNullAt(3))
+    assert(result.getInt(4) == 99)
   }
 
   // ============================================
@@ -358,50 +319,46 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, values1: _*)
     val row2 = createUnsafeRow(schema2, 999)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 65)
-      // Verify first and last values from row1
-      assert(result.getInt(0) == 0)
-      assert(result.getInt(63) == 63)
-      // Verify row2's value
-      assert(result.getInt(64) == 999)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 65)
+    // Verify first and last values from row1
+    assert(result.getInt(0) == 0)
+    assert(result.getInt(63) == 63)
+    // Verify row2's value
+    assert(result.getInt(64) == 999)
   }
 
   test("join with row1 having column count not multiple of 64") {
     // 3 columns in row1 - bitset has 61 unused bits that need to be filled with row2's bits
-    val schema1 = StructType(Seq(
-      StructField("a1", IntegerType),
-      StructField("a2", IntegerType),
-      StructField("a3", IntegerType)
-    ))
-    val schema2 = StructType(Seq(
-      StructField("b1", IntegerType),
-      StructField("b2", IntegerType)
-    ))
+    val schema1 = StructType(
+      Seq(
+        StructField("a1", IntegerType),
+        StructField("a2", IntegerType),
+        StructField("a3", IntegerType)
+      )
+    )
+    val schema2 = StructType(
+      Seq(
+        StructField("b1", IntegerType),
+        StructField("b2", IntegerType)
+      )
+    )
 
     val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
     val row1 = createUnsafeRow(schema1, 1, 2, 3)
     val row2 = createUnsafeRow(schema2, 4, 5)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 5)
-      assert(result.getInt(0) == 1)
-      assert(result.getInt(1) == 2)
-      assert(result.getInt(2) == 3)
-      assert(result.getInt(3) == 4)
-      assert(result.getInt(4) == 5)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 5)
+    assert(result.getInt(0) == 1)
+    assert(result.getInt(1) == 2)
+    assert(result.getInt(2) == 3)
+    assert(result.getInt(3) == 4)
+    assert(result.getInt(4) == 5)
   }
 
   test("join with both rows spanning multiple bitset words") {
@@ -418,19 +375,15 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, values1: _*)
     val row2 = createUnsafeRow(schema2, values2: _*)
 
-    val buf = allocateBuffer(testBufferSize * 4) // Need more space for many columns
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize * 4) // Need more space for many columns
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 130)
-      // Verify boundary values
-      assert(result.getInt(0) == 0)
-      assert(result.getInt(64) == 64)
-      assert(result.getInt(65) == 100)
-      assert(result.getInt(129) == 164)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 130)
+    // Verify boundary values
+    assert(result.getInt(0) == 0)
+    assert(result.getInt(64) == 64)
+    assert(result.getInt(65) == 100)
+    assert(result.getInt(129) == 164)
   }
 
   // ============================================
@@ -445,15 +398,11 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, 42)
     val row2 = createUnsafeRow(schema2)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 1)
-      assert(result.getInt(0) == 42)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 1)
+    assert(result.getInt(0) == 42)
   }
 
   test("join with empty row1 schema") {
@@ -464,15 +413,11 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1)
     val row2 = createUnsafeRow(schema2, 99)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      val result = joiner.join(row1, row2, buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    val result = joiner.join(row1, row2, buf, offset)
 
-      assert(result.numFields() == 1)
-      assert(result.getInt(0) == 99)
-    } finally {
-      freeBuffer(buf)
-    }
+    assert(result.numFields() == 1)
+    assert(result.getInt(0) == 99)
   }
 
   test("join same rows multiple times with same buffer") {
@@ -483,16 +428,12 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
     val row1 = createUnsafeRow(schema1, 10)
     val row2 = createUnsafeRow(schema2, 20)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      // Join multiple times - the joiner should reuse its internal UnsafeRow
-      for (i <- 1 to 100) {
-        val result = joiner.join(row1, row2, buf)
-        assert(result.getInt(0) == 10, s"Failed on iteration $i")
-        assert(result.getInt(1) == 20, s"Failed on iteration $i")
-      }
-    } finally {
-      freeBuffer(buf)
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    // Join multiple times - the joiner should reuse its internal UnsafeRow
+    for (i <- 1 to 100) {
+      val result = joiner.join(row1, row2, buf, offset)
+      assert(result.getInt(0) == 10, s"Failed on iteration $i")
+      assert(result.getInt(1) == 20, s"Failed on iteration $i")
     }
   }
 
@@ -502,94 +443,13 @@ class CustomUnsafeRowJoinerTest extends AnyFunSuite {
 
     val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
 
-    val buf = allocateBuffer(testBufferSize)
-    try {
-      for (i <- 1 to 10) {
-        val row1 = createUnsafeRow(schema1, i)
-        val row2 = createUnsafeRow(schema2, i * 100)
-        val result = joiner.join(row1, row2, buf)
-        assert(result.getInt(0) == i)
-        assert(result.getInt(1) == i * 100)
-      }
-    } finally {
-      freeBuffer(buf)
-    }
-  }
-
-  // ============================================
-  // Integration with RowBatch
-  // ============================================
-
-  test("join and store result in RowBatch") {
-    val schema1 = StructType(Seq(
-      StructField("id", IntegerType),
-      StructField("name", StringType)
-    ))
-    val schema2 = StructType(Seq(
-      StructField("value", IntegerType),
-      StructField("tag", StringType)
-    ))
-
-    val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
-    val row1 = createUnsafeRow(schema1, 1, "Alice")
-    val row2 = createUnsafeRow(schema2, 100, "VIP")
-
-    val batch = new RowBatch(4096)
-    try {
-      val buf = batch.getCurrentPointer
-      val result = joiner.join(row1, row2, buf)
-
-      // Update batch with the size of joined row
-      batch.updateAppendedRowSize(result.getSizeInBytes)
-
-      // Verify we can read the data back from the batch
-      val storedBytes = batch.getRow(0, result.getSizeInBytes)
-      val storedRow = new UnsafeRow(4)
-      storedRow.pointTo(storedBytes, storedBytes.length)
-
-      assert(storedRow.getInt(0) == 1)
-      assert(storedRow.getUTF8String(1).toString == "Alice")
-      assert(storedRow.getInt(2) == 100)
-      assert(storedRow.getUTF8String(3).toString == "VIP")
-    } finally {
-      batch.free()
-    }
-  }
-
-  test("join multiple row pairs and store in RowBatch") {
-    val schema1 = StructType(Seq(StructField("a", IntegerType)))
-    val schema2 = StructType(Seq(StructField("b", IntegerType)))
-
-    val joiner = GenerateCustomUnsafeRowJoiner.create(schema1, schema2)
-    val batch = new RowBatch(4096)
-
-    try {
-      val offsets = new scala.collection.mutable.ArrayBuffer[(Int, Int, Int)]() // (offset, size, expected values)
-
-      for (i <- 0 until 10) {
-        val row1 = createUnsafeRow(schema1, i)
-        val row2 = createUnsafeRow(schema2, i * 10)
-
-        val offset = batch.getCurrentOffset
-        // Need to calculate the buffer address correctly: base pointer + current offset
-        val buf = batch.rowData + offset
-        val result = joiner.join(row1, row2, buf)
-        batch.updateAppendedRowSize(result.getSizeInBytes)
-
-        offsets += ((offset, result.getSizeInBytes, i))
-      }
-
-      // Verify all stored rows
-      for ((offset, size, expectedI) <- offsets) {
-        val storedBytes = batch.getRow(offset, size)
-        val storedRow = new UnsafeRow(2)
-        storedRow.pointTo(storedBytes, storedBytes.length)
-
-        assert(storedRow.getInt(0) == expectedI, s"Row at offset $offset has wrong value for field 0")
-        assert(storedRow.getInt(1) == expectedI * 10, s"Row at offset $offset has wrong value for field 1")
-      }
-    } finally {
-      batch.free()
+    val (buf, offset) = allocateBuffer(testBufferSize)
+    for (i <- 1 to 10) {
+      val row1 = createUnsafeRow(schema1, i)
+      val row2 = createUnsafeRow(schema2, i * 100)
+      val result = joiner.join(row1, row2, buf, offset)
+      assert(result.getInt(0) == i)
+      assert(result.getInt(1) == i * 100)
     }
   }
 }

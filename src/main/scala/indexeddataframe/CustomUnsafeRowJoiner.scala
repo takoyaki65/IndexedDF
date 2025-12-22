@@ -33,22 +33,23 @@ import org.apache.spark.sql.types.StructType
  *
  * Key difference from Spark's standard UnsafeRowJoiner:
  * - Standard UnsafeRowJoiner allocates its own internal memory buffer
- * - This custom version uses an externally provided buffer (off-heap memory address)
+ * - This custom version uses an externally provided buffer (on-heap byte array or off-heap memory)
  *
- * This design enables direct writing of join results to RowBatch's off-heap memory,
+ * This design enables direct writing of join results to PagedRowStorage's memory,
  * avoiding additional memory allocations and improving performance during IndexedJoin operations.
  */
 abstract class CustomUnsafeRowJoiner {
 
   /**
-   * Joins two UnsafeRows into one.
+   * Joins two UnsafeRows into one, writing to an on-heap byte array.
    *
-   * @param row1 The left row (typically from the indexed table)
-   * @param row2 The right row (from the table being joined)
-   * @param buf  Off-heap memory address to write the result (obtained via RowBatch.getCurrentPointer())
+   * @param row1      The left row (typically from the indexed table)
+   * @param row2      The right row (from the table being joined)
+   * @param baseObj   The byte array to write the result to
+   * @param baseOffset The offset within the byte array (including Platform.BYTE_ARRAY_OFFSET)
    * @return A new UnsafeRow pointing to the buffer containing the concatenated data
    */
-  def join(row1: UnsafeRow, row2: UnsafeRow, buf: Long): UnsafeRow
+  def join(row1: UnsafeRow, row2: UnsafeRow, baseObj: AnyRef, baseOffset: Long): UnsafeRow
 }
 
 /**
@@ -141,9 +142,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
    */
   def create(schema1: StructType, schema2: StructType): CustomUnsafeRowJoiner = {
     val ctx = new CodegenContext
-    // Note: offset is 0 because we write directly to off-heap memory (not a byte array)
-    // When writing to a byte array, Platform.BYTE_ARRAY_OFFSET would be used
-    val offset = 0 // Platform.BYTE_ARRAY_OFFSET
+    // Note: offset is 0 because baseOffset parameter already includes Platform.BYTE_ARRAY_OFFSET
+    val offset = 0
     val getLong = "Platform.getLong"
     val putLong = "Platform.putLong"
 
@@ -206,7 +206,7 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
           s"$getLong(obj2, offset2 + ${(i - bitset1Words) * 8})"
         }
       }
-      s"$putLong(null, buf + ${i * 8}, $bits);\n"
+      s"$putLong(baseObj, baseOffset + ${i * 8}, $bits);\n"
     }
 
     // Split the bitset copying code into multiple methods if it's too large
@@ -215,7 +215,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
       expressions = copyBitset,
       funcName = "copyBitsetFunc",
       arguments = ("java.lang.Object", "obj1") :: ("long", "offset1") ::
-        ("java.lang.Object", "obj2") :: ("long", "offset2") :: Nil
+        ("java.lang.Object", "obj2") :: ("long", "offset2") ::
+        ("java.lang.Object", "baseObj") :: ("long", "baseOffset") :: Nil
     )
 
     // =====================================================================================
@@ -232,7 +233,7 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
                                  |// Copy fixed length data for row1 (${schema1.size} columns * 8 bytes)
                                  |Platform.copyMemory(
                                  |  obj1, offset1 + ${bitset1Words * 8},
-                                 |  null, buf + $cursor,
+                                 |  baseObj, baseOffset + $cursor,
                                  |  ${schema1.size * 8});
      """.stripMargin
     cursor += schema1.size * 8
@@ -241,7 +242,7 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
                                  |// Copy fixed length data for row2 (${schema2.size} columns * 8 bytes)
                                  |Platform.copyMemory(
                                  |  obj2, offset2 + ${bitset2Words * 8},
-                                 |  null, buf + $cursor,
+                                 |  baseObj, baseOffset + $cursor,
                                  |  ${schema2.size * 8});
      """.stripMargin
     cursor += schema2.size * 8
@@ -261,7 +262,7 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
                                     |long numBytesVariableRow1 = row1.getSizeInBytes() - $numBytesBitsetAndFixedRow1;
                                     |Platform.copyMemory(
                                     |  obj1, offset1 + ${(bitset1Words + schema1.size) * 8},
-                                    |  null, buf + $cursor,
+                                    |  baseObj, baseOffset + $cursor,
                                     |  numBytesVariableRow1);
      """.stripMargin
 
@@ -271,7 +272,7 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
                                     |long numBytesVariableRow2 = row2.getSizeInBytes() - $numBytesBitsetAndFixedRow2;
                                     |Platform.copyMemory(
                                     |  obj2, offset2 + ${(bitset2Words + schema2.size) * 8},
-                                    |  null, buf + $cursor + numBytesVariableRow1,
+                                    |  baseObj, baseOffset + $cursor + numBytesVariableRow1,
                                     |  numBytesVariableRow2);
      """.stripMargin
 
@@ -329,10 +330,10 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
         // Because UnsafeRowWriter.setNullAt() sets offset=0 and size=0 for NULLs,
         // we can rely on this property safely.
         s"""
-           |existingOffset = $getLong(null, buf + $cursor);
+           |existingOffset = $getLong(baseObj, baseOffset + $cursor);
            |if (existingOffset != 0) {
            |    // Add shift to upper 32 bits (offset) while preserving lower 32 bits (size)
-           |    $putLong(null, buf + $cursor, existingOffset + ($shift << 32));
+           |    $putLong(baseObj, baseOffset + $cursor, existingOffset + ($shift << 32));
            |}
          """.stripMargin
       }
@@ -341,8 +342,9 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
     // Split the offset update code into multiple methods if needed
     val updateOffsets = ctx.splitExpressions(
       expressions = updateOffset,
-      funcName = "copyBitsetFunc", // Note: function name reuse is intentional (Spark codegen quirk)
-      arguments = ("long", "numBytesVariableRow1") :: Nil,
+      funcName = "updateOffsetsFunc",
+      arguments = ("long", "numBytesVariableRow1") ::
+        ("java.lang.Object", "baseObj") :: ("long", "baseOffset") :: Nil,
       makeSplitFunction = (s: String) => "long existingOffset;\n" + s
     )
 
@@ -372,7 +374,7 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
        |
        |  ${ctx.declareAddedFunctions()}
        |
-       |  public UnsafeRow join(UnsafeRow row1, UnsafeRow row2, long buf) {
+       |  public UnsafeRow join(UnsafeRow row1, UnsafeRow row2, java.lang.Object baseObj, long baseOffset) {
        |    // Schema information for debugging:
        |    // row1: ${schema1.size} fields, $bitset1Words words in bitset
        |    // row2: ${schema2.size} fields, $bitset2Words words in bitset
@@ -382,8 +384,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
        |    final int sizeInBytes = row1.getSizeInBytes() + row2.getSizeInBytes() - $sizeReduction;
        |
        |    // Get memory locations of input rows
-       |    final java.lang.Object obj1 = row1.getBaseObject();  // null for off-heap
-       |    final long offset1 = row1.getBaseOffset();           // memory address
+       |    final java.lang.Object obj1 = row1.getBaseObject();
+       |    final long offset1 = row1.getBaseOffset();
        |    final java.lang.Object obj2 = row2.getBaseObject();
        |    final long offset2 = row2.getBaseOffset();
        |
@@ -399,8 +401,8 @@ object GenerateCustomUnsafeRowJoiner extends CodeGenerator[(StructType, StructTy
        |    long existingOffset;
        |    $updateOffsets
        |
-       |    // Point output row to the buffer containing concatenated data
-       |    out.pointTo(null, buf, sizeInBytes);
+       |    // Point output row to the buffer containing concatenated data (on-heap)
+       |    out.pointTo(baseObj, baseOffset, sizeInBytes);
        |
        |    return out;
        |  }

@@ -2,7 +2,6 @@ package indexeddataframe
 
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.Platform
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
@@ -16,9 +15,12 @@ import org.scalatest.funsuite.AnyFunSuite
  * - Duplicate key handling (linked list traversal)
  * - Full partition iteration
  * - Snapshot (copy-on-write) functionality
- * - Bit packing/unpacking for row pointers
  */
 class InternalIndexedPartitionTest extends AnyFunSuite {
+
+  // Test RDD ID and partition ID for memory block identification
+  private val testRddId = 1
+  private val testPartitionId = 0
 
   /**
    * Helper method to create an UnsafeRow from values and schema.
@@ -44,7 +46,7 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
    */
   private def createIntKeyPartition(): InternalIndexedPartition = {
     val partition = new InternalIndexedPartition
-    partition.initialize()
+    partition.initialize(testRddId, testPartitionId)
     val schema = StructType(Seq(
       StructField("key", IntegerType),
       StructField("value", StringType)
@@ -59,7 +61,7 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
    */
   private def createStringKeyPartition(): InternalIndexedPartition = {
     val partition = new InternalIndexedPartition
-    partition.initialize()
+    partition.initialize(testRddId, testPartitionId)
     val schema = StructType(Seq(
       StructField("key", StringType),
       StructField("value", IntegerType)
@@ -75,18 +77,15 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
 
   test("initialize should create empty data structures") {
     val partition = new InternalIndexedPartition
-    partition.initialize()
+    partition.initialize(testRddId, testPartitionId)
 
     assert(partition.index != null, "Index should be initialized")
-    assert(partition.rowBatches != null, "RowBatches should be initialized")
     assert(partition.index.isEmpty, "Index should be empty")
-    assert(partition.rowBatches.isEmpty, "RowBatches should be empty")
   }
 
-  test("createIndex should set up schema and allocate first batch") {
+  test("createIndex should set up schema") {
     val partition = createIntKeyPartition()
 
-    assert(partition.nRowBatches == 1, "Should have one row batch")
     assert(partition.nRows == 0, "Should have no rows")
     assert(partition.size == 0, "Size should be 0")
   }
@@ -211,7 +210,7 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
 
   test("get should work with Long keys") {
     val partition = new InternalIndexedPartition
-    partition.initialize()
+    partition.initialize(testRddId, testPartitionId)
     val schema = StructType(Seq(
       StructField("key", LongType),
       StructField("value", StringType)
@@ -368,7 +367,7 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
     assert(snapshot.get(2).toList.length == 1, "Snapshot should have key 2")
   }
 
-  test("getSnapshot should allocate new batch for writes") {
+  test("getSnapshot should share pages with lazy allocation for new writes") {
     val partition = createIntKeyPartition()
     val schema = StructType(Seq(
       StructField("key", IntegerType),
@@ -376,13 +375,14 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
     ))
 
     partition.appendRow(createUnsafeRow(schema, 1, "original"))
-    val originalBatches = partition.nRowBatches
+    val originalMemory = partition.getMemoryUsed
 
     val snapshot = partition.getSnapshot()
 
-    // Snapshot should have one more batch than original
-    assert(snapshot.nRowBatches == originalBatches + 1,
-      "Snapshot should have one additional batch")
+    // When snapshot writes, it allocates new pages
+    snapshot.appendRow(createUnsafeRow(schema, 2, "snapshot-new"))
+    assert(snapshot.getMemoryUsed > originalMemory,
+      "Snapshot should allocate new memory on write")
   }
 
   // ============================================
@@ -430,23 +430,23 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
     assert(results.length == numRows)
   }
 
-  test("should create multiple row batches for large data") {
+  test("should create multiple pages for large data") {
     val partition = createIntKeyPartition()
     val schema = StructType(Seq(
       StructField("key", IntegerType),
       StructField("value", StringType)
     ))
 
-    // Create rows with large strings to fill batches
-    // BatchSize is 128MB, so we need enough data to exceed that
+    // Create rows with large strings to fill pages
     val largeValue = "x" * 100000 // 100KB per row
-    val numRows = 2000 // ~200MB total, should require multiple 128MB batches
+    val numRows = 100 // ~10MB total, should require multiple 4MB pages
 
     for (i <- 1 to numRows) {
       partition.appendRow(createUnsafeRow(schema, i, largeValue))
     }
 
-    assert(partition.nRowBatches > 1, "Should have multiple batches")
+    assert(partition.getMemoryUsed > PagedRowStorage.DefaultPageSize,
+      "Should have allocated multiple pages")
     assert(partition.nRows == numRows)
 
     // Verify data integrity
@@ -458,7 +458,7 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
 
   test("should handle rows with various data types") {
     val partition = new InternalIndexedPartition
-    partition.initialize()
+    partition.initialize(testRddId, testPartitionId)
     val schema = StructType(Seq(
       StructField("intCol", IntegerType),
       StructField("longCol", LongType),
@@ -477,5 +477,19 @@ class InternalIndexedPartitionTest extends AnyFunSuite {
     assert(row.getLong(1) == 100L)
     assert(math.abs(row.getDouble(2) - 3.14) < 0.001)
     assert(row.getUTF8String(3).toString == "test")
+  }
+
+  test("getMemoryUsed should return correct memory usage") {
+    val partition = createIntKeyPartition()
+    val schema = StructType(Seq(
+      StructField("key", IntegerType),
+      StructField("value", StringType)
+    ))
+
+    assert(partition.getMemoryUsed == 0, "Empty partition should use 0 memory")
+
+    partition.appendRow(createUnsafeRow(schema, 1, "hello"))
+
+    assert(partition.getMemoryUsed > 0, "After insert, should use some memory")
   }
 }

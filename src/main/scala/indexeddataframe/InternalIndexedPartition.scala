@@ -4,8 +4,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.types._
 import scala.collection.concurrent.TrieMap
-import indexeddataframe.RowBatch
-import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateUnsafeRowJoiner, UnsafeRowJoiner}
+import org.apache.spark.sql.catalyst.expressions.codegen.UnsafeRowJoiner
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.hash.Murmur3_x86_32
 
@@ -14,32 +13,49 @@ object InternalIndexedPartition {
   /** Sentinel value indicating the end of a linked list of rows with the same key */
   final val EndOfListSentinel: Long = 0xffffffffffffffffL
 
-  // =====================================================================================
-  // Bit packing configuration for 64-bit row pointers
-  // =====================================================================================
-  //
-  // The pointer layout divides a 64-bit integer into two fields:
-  //   - Batch number: identifies which RowBatch contains the row (upper 32 bits)
-  //   - Offset: byte offset within the RowBatch (lower 32 bits)
-  //
-  // Row size is stored inline at the beginning of each row data (4-byte header).
-  //
-  // Current configuration:
-  //   - 32 bits for batch number → up to ~4 billion batches
-  //   - 32 bits for offset → up to 4GB per batch (128MB used by default)
-  //   - Row size stored as 4-byte (32-bit) header → up to ~2GB per row
-
-  /** Number of bits to represent the batch number (upper 32 bits) */
-  final val NoBitsBatches: Int = 32
-
-  /** Number of bits to represent the offset within a batch (lower 32 bits) */
-  final val NoBitsOffsets: Int = 32
-
   /** Size header bytes prepended to each row (stores row size as 4-byte int) */
   final val RowSizeHeaderBytes: Int = 4
 
-  /** RowBatch size: 128MB per batch (aligned with Spark's default partition size) */
-  final val BatchSize: Int = 128 * 1024 * 1024
+  /** Prev pointer size in bytes */
+  final val PrevPointerBytes: Int = 8
+
+  /** Number of bits used for page index in encoded pointer */
+  final val PageIndexBits: Int = 16
+
+  /** Number of bits used for offset in encoded pointer */
+  final val OffsetBits: Int = 48
+
+  /** Maximum page index value */
+  final val MaxPageIndex: Int = (1 << PageIndexBits) - 1
+
+  /** Maximum offset value */
+  final val MaxOffset: Long = (1L << OffsetBits) - 1
+
+  /** Mask for extracting offset from encoded pointer */
+  final val OffsetMask: Long = MaxOffset
+
+  /**
+   * Encodes page index and offset into a single Long pointer.
+   *
+   * Layout: [16-bit pageIndex][48-bit offset]
+   */
+  def encodePointer(pageIndex: Int, offset: Long): Long = {
+    (pageIndex.toLong << OffsetBits) | (offset & OffsetMask)
+  }
+
+  /**
+   * Decodes page index from an encoded pointer.
+   */
+  def decodePageIndex(pointer: Long): Int = {
+    (pointer >>> OffsetBits).toInt
+  }
+
+  /**
+   * Decodes offset from an encoded pointer.
+   */
+  def decodeOffset(pointer: Long): Long = {
+    pointer & OffsetMask
+  }
 }
 
 /**
@@ -47,8 +63,17 @@ object InternalIndexedPartition {
  *
  * == Overview ==
  *
- * This class stores row data in off-heap memory (via [[RowBatch]]) and maintains a hash index
- * (via CTrie) for fast key lookups. Each partition is independent and can be processed in parallel.
+ * This class stores row data in on-heap byte arrays (via [[PagedRowStorage]]) and maintains
+ * a hash index (via CTrie) for fast key lookups. Each partition is independent and can
+ * be processed in parallel.
+ *
+ * == Memory Management ==
+ *
+ * Row data is stored in on-heap byte arrays managed through Spark's Storage Memory:
+ * - Memory is allocated in pages (default 4MB byte arrays) via [[PagedRowStorage]]
+ * - Spark tracks memory usage and enforces limits
+ * - Pages are lazily allocated (no allocation until first row is appended)
+ * - Uses Spark's default on-heap mode (no special configuration required)
  *
  * == Data Storage Architecture ==
  *
@@ -58,68 +83,56 @@ object InternalIndexedPartition {
  *   ├─────────────────────────────────────────────────────────────────┤
  *   │                                                                 │
  *   │   ┌─────────────────┐          ┌─────────────────────────────┐  │
- *   │   │   CTrie Index   │          │        RowBatches           │  │
- *   │   │ (key → pointer) │          │  (off-heap row storage)     │  │
+ *   │   │   CTrie Index   │          │     PagedRowStorage         │  │
+ *   │   │ (key → pointer) │          │ (Spark Storage Memory)      │  │
  *   │   ├─────────────────┤          ├─────────────────────────────┤  │
- *   │   │ key1 → ptr1     │─────────>│ RowBatch 0 (4MB)            │  │
+ *   │   │ key1 → ptr1     │─────────>│ Page 0 (byte[4MB])          │  │
  *   │   │ key2 → ptr2     │          │  ├─ row1 + #prev            │  │
  *   │   │ key3 → ptr3     │          │  ├─ row2 + #prev            │  │
  *   │   │   ...           │          │  └─ ...                     │  │
- *   │   └─────────────────┘          │ RowBatch 1 (4MB)            │  │
+ *   │   └─────────────────┘          │ Page 1 (byte[4MB])          │  │
  *   │                                │  └─ ...                     │  │
  *   │                                └─────────────────────────────┘  │
  *   └─────────────────────────────────────────────────────────────────┘
  * }}}
  *
- * == Row Pointer Encoding ==
+ * == Pointer Format ==
  *
- * Each index entry maps a key to a 64-bit packed pointer containing:
- *
+ * Index entries store encoded 64-bit pointers:
  * {{{
- *   64-bit pointer layout:
- *   ┌─────────────────────────┬─────────────────────────┐
- *   │    Batch No (32bit)     │     Offset (32bit)      │
- *   │   (up to ~4 billion)    │     (up to 4GB)         │
- *   └─────────────────────────┴─────────────────────────┘
- *   MSB                                              LSB
+ *   [16-bit pageIndex][48-bit offset]
  *
- *   Row data layout in RowBatch:
- *   ┌──────────────┬─────────────────────────────────────┐
- *   │ Size (4byte) │           Row Data (N bytes)        │
- *   └──────────────┴─────────────────────────────────────┘
+ *   - pageIndex: Index into the pages array (supports up to 65535 pages)
+ *   - offset: Byte offset within the page (supports up to 256TB per page)
+ * }}}
  *
- *   This design supports rows up to ~2GB (Integer.MAX_VALUE bytes).
+ * This allows addressing rows within on-heap byte arrays.
+ *
+ * == Row Data Layout ==
+ *
+ * Each row in memory:
+ * {{{
+ *   ┌──────────────┬─────────────────────────┬──────────────┐
+ *   │ Size (4byte) │     UnsafeRow Data      │ Prev (8byte) │
+ *   └──────────────┴─────────────────────────┴──────────────┘
  * }}}
  *
  * == Duplicate Key Handling ==
  *
- * Multiple rows with the same key are stored as a linked list using backward pointers:
- *
+ * Multiple rows with the same key form a linked list via prev pointers:
  * {{{
- *   Index entry for key K:
- *
- *   index[K] ──▶ [row3 | #prev] ──▶ [row2 | #prev] ──▶ [row1 | 0xFF..FF]
- *                (newest)                                (oldest, end marker)
- *
- *   Each stored row has an extra column (#prev) pointing to the previous row
- *   with the same key. The sentinel value 0xFFFFFFFFFFFFFFFF marks the end.
+ *   index[K] ──▶ [row3 | prev] ──▶ [row2 | prev] ──▶ [row1 | 0xFF..FF]
+ *                (newest)                              (oldest, end marker)
  * }}}
  *
  * == Thread Safety ==
  *
- * Uses CTrie (concurrent trie) for both index and rowBatches maps, providing:
+ * Uses CTrie (concurrent trie) for the index, providing:
  * - Lock-free reads with snapshot isolation
  * - Atomic updates for concurrent writes
  * - Efficient snapshots for copy-on-write semantics
- *
- * == Memory Management ==
- *
- * Row data is stored in off-heap memory via RowBatch:
- * - Each batch is 4MB by default
- * - New batches are created when the current one is full
- * - Off-heap storage avoids GC pressure for large datasets
  */
-class InternalIndexedPartition {
+class InternalIndexedPartition extends Serializable {
   import InternalIndexedPartition._
 
   // =====================================================================================
@@ -127,7 +140,7 @@ class InternalIndexedPartition {
   // =====================================================================================
 
   /**
-   * The hash index: maps key (Long) to packed row pointer (Long).
+   * The hash index: maps key (Long) to row address (Long).
    *
    * Uses CTrie for thread-safe concurrent access and efficient snapshots.
    * Non-Long keys (String, Int, Double) are converted to Long via hashing.
@@ -144,14 +157,15 @@ class InternalIndexedPartition {
   private var nColumns: Int = 0
 
   /**
-   * Off-heap storage for row data, organized as a map of batch ID to RowBatch.
-   *
-   * Uses CTrie for thread-safe access and snapshot capability.
+   * Off-heap storage for row data, managed through Spark's Storage Memory.
    */
-  var rowBatches: TrieMap[Int, RowBatch] = null
+  @transient private var storage: PagedRowStorage = null
 
-  /** Number of RowBatches currently allocated */
-  var nRowBatches = 0
+  /** RDD ID for this partition (used for block identification) */
+  private var rddId: Int = 0
+
+  /** Partition ID within the RDD */
+  private var partitionId: Int = 0
 
   // =====================================================================================
   // Row manipulation utilities
@@ -163,14 +177,12 @@ class InternalIndexedPartition {
    * Uses [[CustomUnsafeRowJoiner]] to write directly to off-heap memory,
    * avoiding intermediate allocations.
    */
-  private var backwardPointerJoiner: CustomUnsafeRowJoiner = null
+  @transient private var backwardPointerJoiner: CustomUnsafeRowJoiner = null
 
   /**
    * Projection for converting InternalRow to UnsafeRow if needed.
-   *
-   * Most rows are already UnsafeRow, but this handles edge cases.
    */
-  private var convertToUnsafe: UnsafeProjection = null
+  @transient private var convertToUnsafe: UnsafeProjection = null
 
   // =====================================================================================
   // Initialization and setup
@@ -179,12 +191,14 @@ class InternalIndexedPartition {
   /**
    * Initializes the internal data structures.
    *
-   * Must be called before using the partition. Creates empty CTrie maps
-   * for both the index and row batches.
+   * @param rddId       The RDD ID for memory block identification
+   * @param partitionId The partition ID within the RDD
    */
-  def initialize(): Unit = {
+  def initialize(rddId: Int, partitionId: Int): Unit = {
+    this.rddId = rddId
+    this.partitionId = partitionId
     index = new TrieMap[Long, Long]
-    rowBatches = new TrieMap[Int, RowBatch]
+    storage = new PagedRowStorage(rddId, partitionId)
   }
 
   /** Number of rows stored in this partition */
@@ -194,47 +208,7 @@ class InternalIndexedPartition {
   var dataSize: Long = 0
 
   /**
-   * Creates a new RowBatch and adds it to the rowBatches map.
-   *
-   * Called during initialization and when the current batch is full.
-   * 
-   * @param batchSize Size of the new RowBatch in bytes
-   */
-  private def createRowBatch(batchSize: Int): Unit = {
-    rowBatches.put(nRowBatches, new RowBatch(batchSize))
-    nRowBatches += 1
-  }
-
-  /**
-   * Returns a RowBatch that can accommodate a row of the given size.
-   *
-   * If the current batch doesn't have enough space, a new batch is created.
-   *
-   * @param size The size in bytes of the row to be inserted
-   * @return A RowBatch with enough space for the row
-   */
-  private def getBatchForRowSize(size: Int): RowBatch = {
-    if (!rowBatches.get(nRowBatches - 1).get.canInsert(size)) {
-      // Current batch is full, create a new one
-      if (size > BatchSize) {
-        // Row is larger than default batch size, create a larger batch
-        createRowBatch(size)
-      } else {
-        // Create a standard-sized batch
-        createRowBatch(BatchSize)
-      }
-    }
-    rowBatches.get(nRowBatches - 1).get
-  }
-
-  /**
    * Configures the partition with schema and creates the hash index on a specific column.
-   *
-   * This method:
-   * 1. Builds the schema from the provided output attributes
-   * 2. Sets up the index column
-   * 3. Creates the joiner for appending #prev pointers to rows
-   * 4. Allocates the first RowBatch
    *
    * @param output   Sequence of output attributes (defines schema and column metadata)
    * @param columnNo 0-based index of the column to build the hash index on
@@ -250,77 +224,15 @@ class InternalIndexedPartition {
     this.indexCol = columnNo
 
     // Create a schema for the #prev column (single LongType field)
-    // This column stores the backward pointer for duplicate key handling
     var rightSchema = new StructType()
     val rightField = new StructField("prev", LongType)
     rightSchema = rightSchema.add(rightField)
 
     // Generate code for joining rows with the #prev column
-    // Uses CustomUnsafeRowJoiner to write directly to off-heap memory
     this.backwardPointerJoiner = GenerateCustomUnsafeRowJoiner.create(schema, rightSchema)
 
     // Initialize projection for converting to UnsafeRow if needed
     this.convertToUnsafe = UnsafeProjection.create(schema)
-
-    // Allocate the first RowBatch
-    createRowBatch(BatchSize)
-  }
-
-  // =====================================================================================
-  // Bit packing/unpacking for row pointers
-  // =====================================================================================
-
-  /**
-   * Packs batch number and offset into a single 64-bit pointer.
-   *
-   * Layout (from MSB to LSB):
-   * {{{
-   *   [batchNo: 32 bits][offset: 32 bits]
-   * }}}
-   *
-   * Note: Row size is no longer packed into the pointer. Instead, it is stored
-   * as a 4-byte header at the beginning of each row in the RowBatch.
-   *
-   * @param batchNo The RowBatch ID (0 to ~4 billion)
-   * @param offset  Byte offset within the RowBatch (0 to ~4 billion)
-   * @return A packed 64-bit pointer
-   */
-  private def packBatchOffset(batchNo: Int, offset: Int): Long = {
-    (batchNo.toLong << NoBitsOffsets) | (offset.toLong & 0xffffffffL)
-  }
-
-  /**
-   * Unpacks a 64-bit pointer into its component parts.
-   *
-   * @param value The packed 64-bit pointer
-   * @return A tuple of (batchNo, offset)
-   */
-  private def unpackBatchOffset(value: Long): (Int, Int) = {
-    val batchNo = (value >>> NoBitsOffsets).toInt
-    val offset = value.toInt // Lower 32 bits
-    (batchNo, offset)
-  }
-
-  /**
-   * Reads the row size from the 4-byte header at the given memory location.
-   *
-   * @param baseAddress Base address of the RowBatch
-   * @param offset      Offset within the RowBatch where the size header starts
-   * @return The row size in bytes
-   */
-  private def readRowSizeHeader(baseAddress: Long, offset: Int): Int = {
-    Platform.getInt(null, baseAddress + offset)
-  }
-
-  /**
-   * Writes the row size to the 4-byte header at the given memory location.
-   *
-   * @param baseAddress Base address of the RowBatch
-   * @param offset      Offset within the RowBatch where the size header starts
-   * @param size        The row size in bytes
-   */
-  private def writeRowSizeHeader(baseAddress: Long, offset: Int, size: Int): Unit = {
-    Platform.putInt(null, baseAddress + offset, size)
   }
 
   // =====================================================================================
@@ -329,15 +241,6 @@ class InternalIndexedPartition {
 
   /**
    * Normalizes a key value to Long for index storage and lookup.
-   *
-   * This method handles different key types:
-   * - Long: used as-is
-   * - Int: converted to Long
-   * - String: hashed using Murmur3 to produce a Long
-   * - Double: truncated to Long
-   *
-   * @param key The key value (from UnsafeRow or external lookup)
-   * @return The normalized Long key for index operations
    */
   private def normalizeKey(key: Any): Long = {
     key match {
@@ -357,9 +260,6 @@ class InternalIndexedPartition {
 
   /**
    * Extracts and normalizes the key from an UnsafeRow based on the index column type.
-   *
-   * @param unsafeRow The row to extract the key from
-   * @return The normalized Long key
    */
   private def extractKeyFromRow(unsafeRow: UnsafeRow): Long = {
     schema(indexCol).dataType match {
@@ -385,68 +285,47 @@ class InternalIndexedPartition {
   /**
    * Appends a single row to this partition.
    *
-   * This method performs the following steps:
-   * 1. Extracts the key from the index column (converting to Long if needed)
-   * 2. Creates a #prev row containing a placeholder for the backward pointer
-   * 3. Writes the 4-byte size header, then joins the row with #prev to off-heap memory
-   * 4. Updates the index, linking to any existing rows with the same key
-   *
    * Memory layout for each row:
    * {{{
-   *   ┌──────────────┬─────────────────────────────────────┐
-   *   │ Size (4byte) │   Row Data (original + #prev col)   │
-   *   └──────────────┴─────────────────────────────────────┘
+   *   ┌──────────────┬─────────────────────────┬──────────────┐
+   *   │ Size (4byte) │     UnsafeRow Data      │ Prev (8byte) │
+   *   └──────────────┴─────────────────────────┴──────────────┘
    * }}}
-   *
-   * Duplicate key handling:
-   * - If a row with the same key already exists, the new row's #prev pointer
-   *   is set to point to the existing row (forming a linked list)
-   * - If no existing row, #prev is set to 0xFFFFFFFFFFFFFFFF (end marker)
    *
    * @param row The row to append (InternalRow, will be converted to UnsafeRow if needed)
    */
   def appendRow(row: InternalRow): Unit = {
-    // NOTE: Assume input rows are always UnsafeRow for performance
     val unsafeRow = row.asInstanceOf[UnsafeRow]
 
     // Update data size statistics
-    this.dataSize += unsafeRow.getSizeInBytes()
+    this.dataSize += unsafeRow.getSizeInBytes
 
     // Extract and normalize key from index column
     val key = extractKeyFromRow(unsafeRow)
 
     // Create a single-column UnsafeRow for the #prev pointer
-    // Layout: 8 bytes null bitset + 8 bytes Long value = 16 bytes total
     val prevRow = new UnsafeRow(1)
     val prevByteArray = new Array[Byte](16)
-    // Clear the null bitset (first 8 bytes)
     for (i <- 0 to 7) prevByteArray(i) = 0
     prevRow.pointTo(prevByteArray, 16)
 
     // Calculate total size needed: 4-byte size header + row data + 8 bytes for #prev
-    val estimatedRowSize = unsafeRow.getSizeInBytes + 8 // row + #prev column
-    val totalSizeNeeded = RowSizeHeaderBytes + estimatedRowSize
+    val rowDataSize = unsafeRow.getSizeInBytes + PrevPointerBytes
+    val totalSizeNeeded = RowSizeHeaderBytes + rowDataSize
 
-    // Get a batch with enough space
-    val crntBatch = getBatchForRowSize(totalSizeNeeded)
-    val offset = crntBatch.getCurrentOffset()
-    val ptr = crntBatch.getCurrentPointer()
+    // Allocate memory for this row (returns page index and offset)
+    val (pageIndex, offsetInPage) = storage.allocateForRow(totalSizeNeeded)
+    val page = storage.getPage(pageIndex)
 
-    // Reserve space for size header (write row data after the header)
-    val rowDataOffset = offset + RowSizeHeaderBytes
+    // Write size header
+    Platform.putInt(page, Platform.BYTE_ARRAY_OFFSET + offsetInPage, rowDataSize)
 
-    // Join the row with #prev column, writing directly to off-heap memory
-    var t1 = System.nanoTime()
-    val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, ptr + rowDataOffset)
-    var t2 = System.nanoTime()
-    totalProjections += (t2 - t1)
+    // Join the row with #prev column, writing directly to byte array memory
+    val rowDataOffset = Platform.BYTE_ARRAY_OFFSET + offsetInPage + RowSizeHeaderBytes
+    val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, page, rowDataOffset)
 
-    // Write the size header at the beginning
-    val rowSize = resultRow.getSizeInBytes
-    writeRowSizeHeader(ptr, offset, rowSize)
-
-    // Create packed pointer to this row's location (points to size header)
-    val cTriePointer = packBatchOffset(nRowBatches - 1, offset)
+    // Encode the pointer for this row
+    val encodedPointer = encodePointer(pageIndex, offsetInPage)
 
     // Handle duplicate keys by linking to existing row
     val existingPointer = index.get(key)
@@ -458,23 +337,11 @@ class InternalIndexedPartition {
       resultRow.setLong(this.nColumns, EndOfListSentinel)
     }
 
-    // Update index to point to this (newest) row
-    this.index.put(key, cTriePointer)
-
-    // Finalize the row in the batch (size header + row data)
-    t1 = System.nanoTime()
-    crntBatch.updateAppendedRowSize(RowSizeHeaderBytes + rowSize)
-    t2 = System.nanoTime()
-    totalAppend += (t2 - t1)
+    // Update index to point to this (newest) row's encoded pointer
+    this.index.put(key, encodedPointer)
 
     this.nRows += 1
   }
-
-  /** Accumulated time spent in row projection (nanoseconds, for profiling) */
-  var totalProjections = 0.0
-
-  /** Accumulated time spent in batch append operations (nanoseconds, for profiling) */
-  var totalAppend = 0.0
 
   /**
    * Appends multiple rows to this partition.
@@ -485,7 +352,6 @@ class InternalIndexedPartition {
     rows.foreach { row =>
       appendRow(row)
     }
-    println("append took %f, projection took %f".format(totalAppend / 1000000.0, totalProjections / 1000000.0))
   }
 
   // =====================================================================================
@@ -495,59 +361,33 @@ class InternalIndexedPartition {
   /**
    * Iterator that traverses all rows with the same key using backward pointers.
    *
-   * Follows the linked list from newest to oldest row:
-   * {{{
-   *   index[key] ──▶ row3 ──▶ row2 ──▶ row1 ──▶ END (0xFF..FF)
-   * }}}
-   *
-   * Memory layout for each row:
-   * {{{
-   *   ┌──────────────┬─────────────────────────────────────┐
-   *   │ Size (4byte) │   Row Data (original + #prev col)   │
-   *   └──────────────┴─────────────────────────────────────┘
-   *   ^               ^
-   *   offset          offset + 4 (row data starts here)
-   * }}}
-   *
-   * @param rowPointer Initial packed pointer from the index
+   * @param startPointer Initial encoded pointer from the index
    */
-  class RowIterator(rowPointer: Long) extends Iterator[InternalRow] {
+  class AddressRowIterator(startPointer: Long) extends Iterator[InternalRow] {
     // Reusable UnsafeRow for returning results (includes #prev column)
     private val currentRow = new UnsafeRow(schema.size + 1)
-    // Current position in the linked list
-    private var crntRowPointer = rowPointer
+    // Current encoded pointer in the linked list
+    private var currentPointer = startPointer
 
     def hasNext: Boolean = {
-      // 0xFFFFFFFFFFFFFFFF is the end-of-list sentinel
-      crntRowPointer != EndOfListSentinel
+      currentPointer != EndOfListSentinel
     }
 
     def next(): InternalRow = {
-      // Unpack pointer to get batch number and offset
-      val (batchNo, offset) = unpackBatchOffset(crntRowPointer)
-
-      // Retrieve the RowBatch
-      val batchOpt = rowBatches.get(batchNo)
-      if (batchOpt.isEmpty) {
-        throw new IllegalStateException(
-          s"RowBatch $batchNo not found. crntRowPointer=0x${crntRowPointer.toHexString}, " +
-            s"nRowBatches=$nRowBatches, rowBatches.size=${rowBatches.size}, " +
-            s"rowBatches.keys=${rowBatches.keys.toSeq.sorted.mkString(",")}, " +
-            s"index.size=${index.size}, nRows=$nRows"
-        )
-      }
-
-      val baseAddress = batchOpt.get.rowData
+      // Decode the pointer to get page index and offset
+      val pageIndex = decodePageIndex(currentPointer)
+      val offsetInPage = decodeOffset(currentPointer)
+      val page = storage.getPage(pageIndex)
 
       // Read the row size from the 4-byte header
-      val size = readRowSizeHeader(baseAddress, offset)
+      val size = Platform.getInt(page, Platform.BYTE_ARRAY_OFFSET + offsetInPage)
 
       // Point to the row data (after the size header)
-      val rowDataOffset = offset + RowSizeHeaderBytes
-      currentRow.pointTo(null, baseAddress + rowDataOffset, size)
+      val rowDataOffset = Platform.BYTE_ARRAY_OFFSET + offsetInPage + RowSizeHeaderBytes
+      currentRow.pointTo(page, rowDataOffset, size)
 
       // Follow the backward pointer to the next row with the same key
-      crntRowPointer = currentRow.getLong(nColumns)
+      currentPointer = currentRow.getLong(nColumns)
 
       currentRow
     }
@@ -560,15 +400,11 @@ class InternalIndexedPartition {
    * @return Iterator over matching rows (empty iterator if key not found)
    */
   def get(key: Any): Iterator[InternalRow] = {
-    // Normalize key to Long for index lookup
     val internalKey = normalizeKey(key)
 
-    val rowPointer = index.get(internalKey)
-    if (rowPointer.isDefined) {
-      new RowIterator(rowPointer.get)
-    } else {
-      // Return empty iterator (end marker only)
-      new RowIterator(EndOfListSentinel)
+    index.get(internalKey) match {
+      case Some(address) => new AddressRowIterator(address)
+      case None          => new AddressRowIterator(EndOfListSentinel)
     }
   }
 
@@ -578,18 +414,8 @@ class InternalIndexedPartition {
 
   /**
    * Iterator that traverses ALL rows in the partition.
-   *
-   * Iteration order:
-   * 1. Iterate over all unique keys in the index
-   * 2. For each key, iterate over all rows with that key (following backward pointers)
-   *
-   * This is used for full table scans and RDD operations.
-   *
-   * Implementation uses flatMap to chain all row iterators together,
-   * which is idiomatic Scala and handles empty partitions naturally.
    */
   class PartitionIterator() extends Iterator[InternalRow] {
-    // Chain all row iterators: for each key, get all rows with that key
     private val underlying: Iterator[InternalRow] =
       index.keysIterator.flatMap(key => get(key))
 
@@ -602,10 +428,6 @@ class InternalIndexedPartition {
 
   /**
    * Returns an iterator over all rows in this partition.
-   *
-   * Used by the RDD interface for full table scans.
-   *
-   * @return Iterator over all rows
    */
   def iterator(): Iterator[InternalRow] = {
     new PartitionIterator
@@ -622,9 +444,6 @@ class InternalIndexedPartition {
 
   /**
    * Looks up multiple keys and returns all matching rows.
-   *
-   * @param keys Array of keys to look up
-   * @return Iterator over all matching rows (copied)
    */
   def multiget(keys: Array[AnyVal]): Iterator[InternalRow] = {
     keys.iterator.flatMap { key =>
@@ -634,17 +453,6 @@ class InternalIndexedPartition {
 
   /**
    * Performs an indexed join where this partition is the LEFT (indexed) side.
-   *
-   * For each row in rightIter:
-   * 1. Extract the join key from the right row
-   * 2. Look up matching rows in this partition's index
-   * 3. Join each matching left row with the right row
-   *
-   * @param rightIter    Iterator of rows from the right (non-indexed) side
-   * @param joiner       UnsafeRowJoiner to combine left and right rows
-   * @param rightOutput  Output attributes for the right side (for type info)
-   * @param joinRightCol Column index in right row containing the join key
-   * @return Iterator of joined rows
    */
   def multigetJoinedRight(
       rightIter: Iterator[InternalRow],
@@ -662,17 +470,6 @@ class InternalIndexedPartition {
 
   /**
    * Performs an indexed join where this partition is the RIGHT (indexed) side.
-   *
-   * For each row in leftIter:
-   * 1. Extract the join key from the left row
-   * 2. Look up matching rows in this partition's index
-   * 3. Join the left row with each matching right row
-   *
-   * @param leftIter    Iterator of rows from the left (non-indexed) side
-   * @param joiner      UnsafeRowJoiner to combine left and right rows
-   * @param leftOutput  Output attributes for the left side (for type info)
-   * @param joinLeftCol Column index in left row containing the join key
-   * @return Iterator of joined rows
    */
   def multigetJoinedLeft(
       leftIter: Iterator[InternalRow],
@@ -695,55 +492,56 @@ class InternalIndexedPartition {
   /**
    * Creates a snapshot of this partition for copy-on-write semantics.
    *
-   * This enables the `appendRows` operation on IndexedDataFrame without modifying
-   * the original cached data. The snapshot shares existing data with the original
-   * but can accept new rows independently.
-   *
-   * How it works:
-   * - CTrie's snapshot() creates a read-only view of the existing data
-   * - A new RowBatch is allocated for the copy to receive new writes
-   * - The original partition is unaffected by writes to the copy
-   *
-   * Performance:
-   * - O(1) operation (no data copying)
-   * - CTrie handles all the complexity of concurrent snapshot isolation
-   *
-   * {{{
-   *   Original:                      Snapshot (copy):
-   *   ┌──────────────┐              ┌──────────────┐
-   *   │ index        │◀─ shared ──▶│ index.snap() │
-   *   │ rowBatches   │◀─ shared ──▶│ rowBatches   │
-   *   │ batch[N]     │              │ batch[N+1]   │ ← new writes go here
-   *   └──────────────┘              └──────────────┘
-   * }}}
+   * The snapshot shares existing pages with the original but allocates
+   * new pages for any new writes.
    *
    * @return A new partition that shares existing data but can be written to independently
    */
   def getSnapshot(): InternalIndexedPartition = {
     val copy = new InternalIndexedPartition
 
-    // Create read-only snapshots of both CTries
+    // Create read-only snapshot of index
     copy.index = this.index.snapshot()
-    copy.rowBatches = this.rowBatches.snapshot()
 
-    // Allocate a new RowBatch for the copy to avoid write conflicts
-    // The original's current batch might still be written to
-    copy.nRowBatches = this.nRowBatches
-    copy.createRowBatch(BatchSize)
+    // Create snapshot of storage (shares existing pages)
+    copy.storage = if (this.storage != null) this.storage.snapshot() else null
 
     // Copy metadata
+    copy.rddId = this.rddId
+    copy.partitionId = this.partitionId
     copy.schema = this.schema
     copy.indexCol = this.indexCol
     copy.nColumns = this.nColumns
     copy.nRows = this.nRows
+    copy.dataSize = this.dataSize
 
     // Initialize projections for the copy
-    var rightSchema = new StructType()
-    val rightField = new StructField("prev", LongType)
-    rightSchema = rightSchema.add(rightField)
-    copy.backwardPointerJoiner = GenerateCustomUnsafeRowJoiner.create(schema, rightSchema)
-    copy.convertToUnsafe = UnsafeProjection.create(schema)
+    if (schema != null) {
+      var rightSchema = new StructType()
+      val rightField = new StructField("prev", LongType)
+      rightSchema = rightSchema.add(rightField)
+      copy.backwardPointerJoiner = GenerateCustomUnsafeRowJoiner.create(schema, rightSchema)
+      copy.convertToUnsafe = UnsafeProjection.create(schema)
+    }
 
     copy
+  }
+
+  /**
+   * Frees all allocated memory.
+   * Should be called when the partition is no longer needed.
+   */
+  def free(): Unit = {
+    if (storage != null) {
+      storage.free()
+      storage = null
+    }
+  }
+
+  /**
+   * Returns the total memory used by this partition.
+   */
+  def getMemoryUsed: Long = {
+    if (storage != null) storage.getMemoryUsed else 0L
   }
 }

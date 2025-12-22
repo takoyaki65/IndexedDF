@@ -1,6 +1,5 @@
 package indexeddataframe
 
-import indexeddataframe.InternalIndexedPartition
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
@@ -8,13 +7,10 @@ import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
-import org.apache.spark.sql.types.{DataType, LongType, StructType}
+import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.storage.StorageLevel
-import org.github.jamm.MemoryMeter
-import org.apache.log4j.{Level, LogManager}
 
 object Utils {
-  private val logger = LogManager.getRootLogger
   def defaultNoPartitions: Int = 16
   val defaultPartitioner: HashPartitioner = new HashPartitioner(defaultNoPartitions)
 
@@ -23,35 +19,21 @@ object Utils {
     * @param colNo
     * @param rows
     * @param output
+    * @param rddId       RDD ID for Spark memory block identification
+    * @param partitionId Partition ID within the RDD
     * @return
     */
-  def doIndexing(colNo: Int, rows: Iterator[InternalRow], output: Seq[Attribute]): InternalIndexedPartition = {
+  def doIndexing(
+      colNo: Int,
+      rows: Iterator[InternalRow],
+      output: Seq[Attribute],
+      rddId: Int,
+      partitionId: Int
+  ): InternalIndexedPartition = {
     val idf = new InternalIndexedPartition
-    idf.initialize()
+    idf.initialize(rddId, partitionId)
     idf.createIndex(output, colNo)
     idf.appendRows(rows)
-    /*
-    val meter = new MemoryMeter()
-    val MB = 1024 * 1024
-    logger.setLevel(Level.DEBUG)
-    logger.info(" ======== measuring... ============")
-    logger.info("total = " + meter.measureDeep(idf) / MB)
-    logger.info("rows = " + meter.measureDeep(idf.rowBatches) / MB)
-    logger.info("index = " + meter.measureDeep(idf.index) / MB)
-    logger.info("#children = " + meter.countChildren(idf))
-    logger.info("nBatches = " + (idf.nRowBatches * 8 / MB))
-    logger.info("data = " + idf.dataSize / MB)
-    logger.info("==========================")
-     */
-    /*
-    val iter = idf.get(32985348972561L)
-    var nRows = 0
-    while (iter.hasNext) {
-      nRows += 1
-      iter.next()
-    }
-    println("this item is repeated %d times on this partition".format(nRows))
-     */
     idf
   }
 

@@ -91,9 +91,15 @@ case class CreateIndexExec(override val indexColNo: Int, child: SparkPlan) exten
     logger.debug("executing the createIndex operator")
 
     // create the index
-    val partitions = child
-      .execute()
-      .mapPartitions[InternalIndexedPartition](rowIter => Iterator(Utils.doIndexing(indexColNo, rowIter, output)), true)
+    val childRDD = child.execute()
+    val rddId = childRDD.id
+    val outputAttrs = output
+
+    val partitions = childRDD
+      .mapPartitionsWithIndex[InternalIndexedPartition](
+        (partitionId, rowIter) => Iterator(Utils.doIndexing(indexColNo, rowIter, outputAttrs, rddId, partitionId)),
+        preservesPartitioning = true
+      )
     val ret = new IRDD(indexColNo, partitions)
     Utils.ensureCached(ret)
   }
