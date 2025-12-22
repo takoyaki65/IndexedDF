@@ -77,8 +77,10 @@ object InternalIndexedPartition {
  * - Memory is allocated in pages (default 4MB byte arrays)
  * - During indexing, rows are accumulated in an OFF-HEAP buffer (via Platform.allocateMemory)
  * - Using off-heap buffer prevents GC pressure during massive parallel indexing tasks
- * - When buffer exceeds page size, data is copied to on-heap and off-heap buffer is freed immediately
- * - finishIndexing() finalizes remaining buffer with minimal on-heap allocation, then frees off-heap
+ * - Buffer is REUSED across pages: when buffer exceeds page size, data is copied to on-heap page
+ *   and buffer offset is reset (buffer itself is not freed)
+ * - Buffer grows via Platform.reallocateMemory if needed for oversized rows
+ * - finishIndexing() finalizes remaining buffer, then frees off-heap memory
  *
  * Memory lifecycle is managed by Spark's RDD cache mechanism:
  * - When RDD[InternalIndexedPartition].cache() is called, Spark serializes
@@ -172,9 +174,13 @@ class InternalIndexedPartition extends Serializable {
   /**
    * Off-heap buffer address for accumulating rows before finalizing into a page.
    * Uses Platform.allocateMemory/freeMemory for immediate memory release without GC.
-   * Size is DefaultPageSize. When buffer fills up, it becomes a page.
+   * Buffer starts at DefaultPageSize and grows via reallocateMemory as needed.
+   * Buffer is reused across multiple pages and only freed in finishIndexing().
    */
   @transient private var bufferAddress: Long = 0
+
+  /** Current capacity of the off-heap buffer in bytes */
+  @transient private var bufferCapacity: Int = 0
 
   /** Current write offset within the buffer */
   @transient private var bufferOffset: Int = 0
@@ -221,6 +227,7 @@ class InternalIndexedPartition extends Serializable {
     index = new TrieMap[Long, Long]
     pages = new ArrayBuffer[Array[Byte]]()
     bufferAddress = 0
+    bufferCapacity = 0
     bufferOffset = 0
     totalMemoryUsed = 0
   }
@@ -307,12 +314,25 @@ class InternalIndexedPartition extends Serializable {
   // =====================================================================================
 
   /**
-   * Ensures an off-heap buffer is available for writing. Allocates if needed.
+   * Ensures an off-heap buffer is available with at least the required capacity.
+   * If buffer doesn't exist, allocates DefaultPageSize.
+   * If buffer exists but is too small, grows it via reallocateMemory.
+   * Buffer is reused across pages and only freed in finishIndexing().
+   *
+   * @param requiredCapacity minimum capacity needed (bufferOffset + new row size)
    */
-  private def ensureBuffer(): Unit = {
+  private def ensureBufferCapacity(requiredCapacity: Int): Unit = {
     if (bufferAddress == 0) {
-      bufferAddress = Platform.allocateMemory(DefaultPageSize)
+      // Initial allocation
+      val initialCapacity = math.max(DefaultPageSize, requiredCapacity)
+      bufferAddress = Platform.allocateMemory(initialCapacity)
+      bufferCapacity = initialCapacity
       bufferOffset = 0
+    } else if (requiredCapacity > bufferCapacity) {
+      // Need to grow: double the size or use required capacity, whichever is larger
+      val newCapacity = math.max(bufferCapacity * 2, requiredCapacity)
+      bufferAddress = Platform.reallocateMemory(bufferAddress, bufferCapacity, newCapacity)
+      bufferCapacity = newCapacity
     }
   }
 
@@ -323,13 +343,15 @@ class InternalIndexedPartition extends Serializable {
     if (bufferAddress != 0) {
       Platform.freeMemory(bufferAddress)
       bufferAddress = 0
+      bufferCapacity = 0
       bufferOffset = 0
     }
   }
 
   /**
-   * Finalizes the current buffer as an immutable on-heap page.
-   * Copies data from off-heap buffer to on-heap array, then frees off-heap buffer.
+   * Finalizes the current buffer content as an immutable on-heap page.
+   * Copies data from off-heap buffer to on-heap array, then resets offset.
+   * Buffer is NOT freed - it's reused for next page.
    */
   private def finalizeBuffer(): Unit = {
     if (bufferAddress != 0 && bufferOffset > 0) {
@@ -340,8 +362,8 @@ class InternalIndexedPartition extends Serializable {
       pages += page
       totalMemoryUsed += bufferOffset
 
-      // Free off-heap buffer immediately
-      freeBuffer()
+      // Reset offset but keep buffer for reuse
+      bufferOffset = 0
     }
   }
 
@@ -414,14 +436,13 @@ class InternalIndexedPartition extends Serializable {
       return
     }
 
-    // Ensure buffer is available
-    ensureBuffer()
-
-    // Check if row fits in current buffer, if not finalize and start new buffer
-    if (bufferOffset + totalSizeNeeded > DefaultPageSize) {
+    // Check if current buffer content exceeds page size threshold, if so finalize as a page
+    if (bufferOffset > 0 && bufferOffset + totalSizeNeeded > DefaultPageSize) {
       finalizeBuffer()
-      ensureBuffer()
     }
+
+    // Ensure buffer has enough capacity for the new row
+    ensureBufferCapacity(bufferOffset + totalSizeNeeded)
 
     val pageIndex = pages.size // Current page index (buffer will become this page)
     val offsetInPage = bufferOffset
