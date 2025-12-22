@@ -7,6 +7,7 @@ import scala.collection.concurrent.TrieMap
 import org.apache.spark.sql.catalyst.expressions.codegen.UnsafeRowJoiner
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.hash.Murmur3_x86_32
+import scala.collection.mutable.ArrayBuffer
 
 object InternalIndexedPartition {
 
@@ -33,6 +34,9 @@ object InternalIndexedPartition {
 
   /** Mask for extracting offset from encoded pointer */
   final val OffsetMask: Long = MaxOffset
+
+  /** Default page size: 4MB */
+  final val DefaultPageSize: Int = 4 * 1024 * 1024
 
   /**
    * Encodes page index and offset into a single Long pointer.
@@ -63,17 +67,23 @@ object InternalIndexedPartition {
  *
  * == Overview ==
  *
- * This class stores row data in on-heap byte arrays (via [[PagedRowStorage]]) and maintains
+ * This class stores row data in on-heap byte arrays (pages) and maintains
  * a hash index (via CTrie) for fast key lookups. Each partition is independent and can
  * be processed in parallel.
  *
  * == Memory Management ==
  *
- * Row data is stored in on-heap byte arrays managed through Spark's Storage Memory:
- * - Memory is allocated in pages (default 4MB byte arrays) via [[PagedRowStorage]]
- * - Spark tracks memory usage and enforces limits
- * - Pages are lazily allocated (no allocation until first row is appended)
- * - Uses Spark's default on-heap mode (no special configuration required)
+ * Row data is stored in on-heap byte arrays:
+ * - Memory is allocated in pages (default 4MB byte arrays)
+ * - During indexing, rows are accumulated in a buffer
+ * - When buffer exceeds page size, it's finalized as an immutable page
+ * - finishIndexing() finalizes remaining buffer with minimal memory allocation
+ *
+ * Memory lifecycle is managed by Spark's RDD cache mechanism:
+ * - When RDD[InternalIndexedPartition].cache() is called, Spark serializes
+ *   the partition (including pages) and stores it in BlockManager
+ * - When unpersist() is called, Spark removes the blocks and the objects
+ *   become eligible for garbage collection
  *
  * == Data Storage Architecture ==
  *
@@ -83,14 +93,14 @@ object InternalIndexedPartition {
  *   ├─────────────────────────────────────────────────────────────────┤
  *   │                                                                 │
  *   │   ┌─────────────────┐          ┌─────────────────────────────┐  │
- *   │   │   CTrie Index   │          │     PagedRowStorage         │  │
- *   │   │ (key → pointer) │          │ (Spark Storage Memory)      │  │
+ *   │   │   CTrie Index   │          │     Pages (immutable)       │  │
+ *   │   │ (key → pointer) │          │ ArrayBuffer[Array[Byte]]    │  │
  *   │   ├─────────────────┤          ├─────────────────────────────┤  │
- *   │   │ key1 → ptr1     │─────────>│ Page 0 (byte[4MB])          │  │
+ *   │   │ key1 → ptr1     │─────────>│ Page 0 (byte[])             │  │
  *   │   │ key2 → ptr2     │          │  ├─ row1 + #prev            │  │
  *   │   │ key3 → ptr3     │          │  ├─ row2 + #prev            │  │
  *   │   │   ...           │          │  └─ ...                     │  │
- *   │   └─────────────────┘          │ Page 1 (byte[4MB])          │  │
+ *   │   └─────────────────┘          │ Page 1 (byte[])             │  │
  *   │                                │  └─ ...                     │  │
  *   │                                └─────────────────────────────┘  │
  *   └─────────────────────────────────────────────────────────────────┘
@@ -105,8 +115,6 @@ object InternalIndexedPartition {
  *   - pageIndex: Index into the pages array (supports up to 65535 pages)
  *   - offset: Byte offset within the page (supports up to 256TB per page)
  * }}}
- *
- * This allows addressing rows within on-heap byte arrays.
  *
  * == Row Data Layout ==
  *
@@ -130,7 +138,6 @@ object InternalIndexedPartition {
  * Uses CTrie (concurrent trie) for the index, providing:
  * - Lock-free reads with snapshot isolation
  * - Atomic updates for concurrent writes
- * - Efficient snapshots for copy-on-write semantics
  */
 class InternalIndexedPartition extends Serializable {
   import InternalIndexedPartition._
@@ -142,7 +149,7 @@ class InternalIndexedPartition extends Serializable {
   /**
    * The hash index: maps key (Long) to row address (Long).
    *
-   * Uses CTrie for thread-safe concurrent access and efficient snapshots.
+   * Uses CTrie for thread-safe concurrent access.
    * Non-Long keys (String, Int, Double) are converted to Long via hashing.
    */
   var index: TrieMap[Long, Long] = null
@@ -157,15 +164,27 @@ class InternalIndexedPartition extends Serializable {
   private var nColumns: Int = 0
 
   /**
-   * Off-heap storage for row data, managed through Spark's Storage Memory.
+   * Immutable pages containing finalized row data.
    */
-  @transient private var storage: PagedRowStorage = null
+  @transient private var pages: ArrayBuffer[Array[Byte]] = null
+
+  /**
+   * Buffer for accumulating rows before finalizing into a page.
+   * Size is DefaultPageSize. When buffer fills up, it becomes a page.
+   */
+  @transient private var buffer: Array[Byte] = null
+
+  /** Current write offset within the buffer */
+  @transient private var bufferOffset: Int = 0
 
   /** RDD ID for this partition (used for block identification) */
   private var rddId: Int = 0
 
   /** Partition ID within the RDD */
   private var partitionId: Int = 0
+
+  /** Total memory used by pages (for statistics) */
+  @transient private var totalMemoryUsed: Long = 0
 
   // =====================================================================================
   // Row manipulation utilities
@@ -174,7 +193,7 @@ class InternalIndexedPartition extends Serializable {
   /**
    * Joiner that appends the #prev column to each row during insertion.
    *
-   * Uses [[CustomUnsafeRowJoiner]] to write directly to off-heap memory,
+   * Uses [[CustomUnsafeRowJoiner]] to write directly to memory,
    * avoiding intermediate allocations.
    */
   @transient private var backwardPointerJoiner: CustomUnsafeRowJoiner = null
@@ -198,7 +217,10 @@ class InternalIndexedPartition extends Serializable {
     this.rddId = rddId
     this.partitionId = partitionId
     index = new TrieMap[Long, Long]
-    storage = new PagedRowStorage(rddId, partitionId)
+    pages = new ArrayBuffer[Array[Byte]]()
+    buffer = null
+    bufferOffset = 0
+    totalMemoryUsed = 0
   }
 
   /** Number of rows stored in this partition */
@@ -279,6 +301,37 @@ class InternalIndexedPartition extends Serializable {
   }
 
   // =====================================================================================
+  // Buffer and page management
+  // =====================================================================================
+
+  /**
+   * Ensures a buffer is available for writing. Allocates if needed.
+   */
+  private def ensureBuffer(): Unit = {
+    if (buffer == null) {
+      buffer = new Array[Byte](DefaultPageSize)
+      bufferOffset = 0
+    }
+  }
+
+  /**
+   * Finalizes the current buffer as an immutable page.
+   * The buffer is added to pages and a new buffer will be allocated on next write.
+   */
+  private def finalizeBuffer(): Unit = {
+    if (buffer != null && bufferOffset > 0) {
+      // Create a right-sized array for this page
+      val page = new Array[Byte](bufferOffset)
+      System.arraycopy(buffer, 0, page, 0, bufferOffset)
+      pages += page
+      totalMemoryUsed += bufferOffset
+
+      buffer = null
+      bufferOffset = 0
+    }
+  }
+
+  // =====================================================================================
   // Row insertion methods
   // =====================================================================================
 
@@ -313,16 +366,58 @@ class InternalIndexedPartition extends Serializable {
     val rowDataSize = unsafeRow.getSizeInBytes + PrevPointerBytes
     val totalSizeNeeded = RowSizeHeaderBytes + rowDataSize
 
-    // Allocate memory for this row (returns page index and offset)
-    val (pageIndex, offsetInPage) = storage.allocateForRow(totalSizeNeeded)
-    val page = storage.getPage(pageIndex)
+    // Handle oversized rows: if row is larger than page size, create dedicated page
+    if (totalSizeNeeded > DefaultPageSize) {
+      // Finalize current buffer first
+      finalizeBuffer()
+
+      // Create a dedicated page for this large row
+      val largePage = new Array[Byte](totalSizeNeeded)
+
+      // Write size header
+      Platform.putInt(largePage, Platform.BYTE_ARRAY_OFFSET, rowDataSize)
+
+      // Join the row with #prev column
+      val rowDataOffset = Platform.BYTE_ARRAY_OFFSET + RowSizeHeaderBytes
+      val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, largePage, rowDataOffset)
+
+      // Encode pointer for this row
+      val encodedPointer = encodePointer(pages.size, 0)
+
+      // Handle duplicate keys
+      val existingPointer = index.get(key)
+      if (existingPointer.isDefined) {
+        resultRow.setLong(this.nColumns, existingPointer.get)
+      } else {
+        resultRow.setLong(this.nColumns, EndOfListSentinel)
+      }
+
+      // Add large page and update index
+      pages += largePage
+      totalMemoryUsed += totalSizeNeeded
+      this.index.put(key, encodedPointer)
+      this.nRows += 1
+      return
+    }
+
+    // Ensure buffer is available
+    ensureBuffer()
+
+    // Check if row fits in current buffer, if not finalize and start new buffer
+    if (bufferOffset + totalSizeNeeded > DefaultPageSize) {
+      finalizeBuffer()
+      ensureBuffer()
+    }
+
+    val pageIndex = pages.size // Current page index (buffer will become this page)
+    val offsetInPage = bufferOffset
 
     // Write size header
-    Platform.putInt(page, Platform.BYTE_ARRAY_OFFSET + offsetInPage, rowDataSize)
+    Platform.putInt(buffer, Platform.BYTE_ARRAY_OFFSET + offsetInPage, rowDataSize)
 
-    // Join the row with #prev column, writing directly to byte array memory
+    // Join the row with #prev column, writing directly to buffer
     val rowDataOffset = Platform.BYTE_ARRAY_OFFSET + offsetInPage + RowSizeHeaderBytes
-    val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, page, rowDataOffset)
+    val resultRow = backwardPointerJoiner.join(unsafeRow, prevRow, buffer, rowDataOffset)
 
     // Encode the pointer for this row
     val encodedPointer = encodePointer(pageIndex, offsetInPage)
@@ -340,6 +435,7 @@ class InternalIndexedPartition extends Serializable {
     // Update index to point to this (newest) row's encoded pointer
     this.index.put(key, encodedPointer)
 
+    bufferOffset += totalSizeNeeded
     this.nRows += 1
   }
 
@@ -354,9 +450,36 @@ class InternalIndexedPartition extends Serializable {
     }
   }
 
+  /**
+   * Finalizes the indexing process.
+   *
+   * This method MUST be called after all rows have been appended.
+   * It finalizes any remaining data in the buffer as a page with minimal
+   * memory allocation (only the exact size needed, not full 4MB).
+   */
+  def finishIndexing(): Unit = {
+    if (buffer != null && bufferOffset > 0) {
+      // Create a right-sized array (not full 4MB)
+      val page = new Array[Byte](bufferOffset)
+      System.arraycopy(buffer, 0, page, 0, bufferOffset)
+      pages += page
+      totalMemoryUsed += bufferOffset
+
+      buffer = null
+      bufferOffset = 0
+    }
+  }
+
   // =====================================================================================
   // Key lookup and row iteration
   // =====================================================================================
+
+  /**
+   * Gets a page by index.
+   */
+  def getPage(pageIndex: Int): Array[Byte] = {
+    pages(pageIndex)
+  }
 
   /**
    * Iterator that traverses all rows with the same key using backward pointers.
@@ -377,7 +500,7 @@ class InternalIndexedPartition extends Serializable {
       // Decode the pointer to get page index and offset
       val pageIndex = decodePageIndex(currentPointer)
       val offsetInPage = decodeOffset(currentPointer)
-      val page = storage.getPage(pageIndex)
+      val page = getPage(pageIndex)
 
       // Read the row size from the 4-byte header
       val size = Platform.getInt(page, Platform.BYTE_ARRAY_OFFSET + offsetInPage)
@@ -486,62 +609,33 @@ class InternalIndexedPartition extends Serializable {
   }
 
   // =====================================================================================
-  // Copy-on-Write (Snapshot) support
+  // Memory management
   // =====================================================================================
 
   /**
-   * Creates a snapshot of this partition for copy-on-write semantics.
-   *
-   * The snapshot shares existing pages with the original but allocates
-   * new pages for any new writes.
-   *
-   * @return A new partition that shares existing data but can be written to independently
-   */
-  def getSnapshot(): InternalIndexedPartition = {
-    val copy = new InternalIndexedPartition
-
-    // Create read-only snapshot of index
-    copy.index = this.index.snapshot()
-
-    // Create snapshot of storage (shares existing pages)
-    copy.storage = if (this.storage != null) this.storage.snapshot() else null
-
-    // Copy metadata
-    copy.rddId = this.rddId
-    copy.partitionId = this.partitionId
-    copy.schema = this.schema
-    copy.indexCol = this.indexCol
-    copy.nColumns = this.nColumns
-    copy.nRows = this.nRows
-    copy.dataSize = this.dataSize
-
-    // Initialize projections for the copy
-    if (schema != null) {
-      var rightSchema = new StructType()
-      val rightField = new StructField("prev", LongType)
-      rightSchema = rightSchema.add(rightField)
-      copy.backwardPointerJoiner = GenerateCustomUnsafeRowJoiner.create(schema, rightSchema)
-      copy.convertToUnsafe = UnsafeProjection.create(schema)
-    }
-
-    copy
-  }
-
-  /**
-   * Frees all allocated memory.
-   * Should be called when the partition is no longer needed.
+   * Clears all data structures.
+   * Note: Actual memory is managed by Spark's RDD cache mechanism.
+   * When the RDD is unpersisted, the serialized InternalIndexedPartition
+   * objects (including pages) are garbage collected.
    */
   def free(): Unit = {
-    if (storage != null) {
-      storage.free()
-      storage = null
+    if (pages != null) {
+      pages.clear()
     }
+    buffer = null
+    bufferOffset = 0
+    totalMemoryUsed = 0
   }
 
   /**
    * Returns the total memory used by this partition.
    */
-  def getMemoryUsed: Long = {
-    if (storage != null) storage.getMemoryUsed else 0L
+  def getMemoryUsed: Long = totalMemoryUsed
+
+  /**
+   * Returns the number of pages allocated.
+   */
+  def getPageCount: Int = {
+    if (pages != null) pages.size else 0
   }
 }

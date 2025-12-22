@@ -34,6 +34,7 @@ object Utils {
     idf.initialize(rddId, partitionId)
     idf.createIndex(output, colNo)
     idf.appendRows(rows)
+    idf.finishIndexing()
     idf
   }
 
