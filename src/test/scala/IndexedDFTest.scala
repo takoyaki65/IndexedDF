@@ -13,6 +13,7 @@ class IndexedDFTest extends AnyFunSuite {
     .appName("spark test app")
     .config("spark.sql.shuffle.partitions", "3")
     .config("spark.sql.adaptive.enabled", "false")
+    .config("spark.log.level", "ERROR")
     .getOrCreate()
 
   import sparkSession.implicits._
@@ -1134,5 +1135,328 @@ class IndexedDFTest extends AnyFunSuite {
     val count = result.collect().length
     println(s"Left Outer Join with Duplicates result: $count rows (expected: 5)")
     assert(count == 5, s"Expected 5 rows but got $count")
+  }
+
+  // ============================================
+  // Non-equi join predicate tests
+  // Tests for otherPredicates support in IndexedShuffledEquiJoinExec
+  // ============================================
+
+  test("join with non-equi predicate - greater than") {
+    // Test: equi-join + non-equi predicate (a.value > b.threshold)
+    val dfA = Seq(
+      (1, 100),
+      (2, 200),
+      (3, 300),
+      (4, 50)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 80), // id=1, threshold=80 -> value(100) > threshold(80) = true
+      (2, 250), // id=2, threshold=250 -> value(200) > threshold(250) = false
+      (3, 300), // id=3, threshold=300 -> value(300) > threshold(300) = false
+      (4, 40) // id=4, threshold=40 -> value(50) > threshold(40) = true
+    ).toDF("id", "threshold")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_gt_a")
+    dfB.createOrReplaceTempView("nonequi_gt_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_gt_a a
+      JOIN nonequi_gt_b b ON a.id = b.id AND a.value > b.threshold
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate (>) Result ===")
+    result.show()
+
+    // Expected: only id=1 and id=4 satisfy both equi (id match) and non-equi (value > threshold)
+    val count = result.collect().length
+    println(s"Join with > predicate result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count - non-equi predicate may not be applied")
+
+    // Verify the correct rows are returned
+    val ids = result.collect().map(_.getInt(0)).sorted
+    assert(ids.sameElements(Array(1, 4)), s"Expected ids [1, 4] but got ${ids.mkString("[", ", ", "]")}")
+  }
+
+  test("join with non-equi predicate - less than") {
+    // Test: equi-join + non-equi predicate (a.value < b.threshold)
+    val dfA = Seq(
+      (1, 100),
+      (2, 200),
+      (3, 50)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 150), // value(100) < threshold(150) = true
+      (2, 150), // value(200) < threshold(150) = false
+      (3, 100) // value(50) < threshold(100) = true
+    ).toDF("id", "threshold")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_lt_a")
+    dfB.createOrReplaceTempView("nonequi_lt_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_lt_a a
+      JOIN nonequi_lt_b b ON a.id = b.id AND a.value < b.threshold
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate (<) Result ===")
+    result.show()
+
+    // Expected: id=1 and id=3
+    val count = result.collect().length
+    println(s"Join with < predicate result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  test("join with non-equi predicate - greater than or equal") {
+    // Test: a.value >= b.threshold
+    val dfA = Seq(
+      (1, 100),
+      (2, 200),
+      (3, 300)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 100), // value(100) >= threshold(100) = true
+      (2, 250), // value(200) >= threshold(250) = false
+      (3, 200) // value(300) >= threshold(200) = true
+    ).toDF("id", "threshold")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_gte_a")
+    dfB.createOrReplaceTempView("nonequi_gte_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_gte_a a
+      JOIN nonequi_gte_b b ON a.id = b.id AND a.value >= b.threshold
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate (>=) Result ===")
+    result.show()
+
+    // Expected: id=1 and id=3
+    val count = result.collect().length
+    println(s"Join with >= predicate result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  test("join with non-equi predicate - not equal") {
+    // Test: a.status != b.status
+    val dfA = Seq(
+      (1, "active"),
+      (2, "inactive"),
+      (3, "active")
+    ).toDF("id", "status")
+
+    val dfB = Seq(
+      (1, "active"), // status match -> != is false
+      (2, "active"), // status differ -> != is true
+      (3, "pending") // status differ -> != is true
+    ).toDF("id", "status")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_neq_a")
+    dfB.createOrReplaceTempView("nonequi_neq_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_neq_a a
+      JOIN nonequi_neq_b b ON a.id = b.id AND a.status != b.status
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate (!=) Result ===")
+    result.show()
+
+    // Expected: id=2 and id=3 (where status differs)
+    val count = result.collect().length
+    println(s"Join with != predicate result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  test("join with multiple non-equi predicates") {
+    // Test: equi-join + multiple non-equi predicates
+    val dfA = Seq(
+      (1, 100, 10),
+      (2, 200, 20),
+      (3, 300, 30),
+      (4, 150, 15)
+    ).toDF("id", "value", "score")
+
+    val dfB = Seq(
+      (1, 80, 5), // value(100) > 80 AND score(10) > 5 -> true AND true = true
+      (2, 180, 25), // value(200) > 180 AND score(20) > 25 -> true AND false = false
+      (3, 350, 20), // value(300) > 350 -> false
+      (4, 100, 10) // value(150) > 100 AND score(15) > 10 -> true AND true = true
+    ).toDF("id", "min_value", "min_score")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_multi_a")
+    dfB.createOrReplaceTempView("nonequi_multi_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_multi_a a
+      JOIN nonequi_multi_b b ON a.id = b.id
+                            AND a.value > b.min_value
+                            AND a.score > b.min_score
+    """)
+
+    result.explain(true)
+    println("=== Join with Multiple Non-Equi Predicates Result ===")
+    result.show()
+
+    // Expected: id=1 and id=4 (both conditions must be true)
+    val count = result.collect().length
+    println(s"Join with multiple non-equi predicates result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+
+    val ids = result.collect().map(_.getInt(0)).sorted
+    assert(ids.sameElements(Array(1, 4)), s"Expected ids [1, 4] but got ${ids.mkString("[", ", ", "]")}")
+  }
+
+  test("join with non-equi predicate and duplicates") {
+    // Test: non-equi predicate with duplicate keys
+    val dfA = Seq(
+      (1, 100),
+      (1, 200), // duplicate key with different value
+      (2, 150)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 150), // For id=1: value(100) > 150 = false, value(200) > 150 = true
+      (2, 100) // For id=2: value(150) > 100 = true
+    ).toDF("id", "threshold")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_dup_a")
+    dfB.createOrReplaceTempView("nonequi_dup_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_dup_a a
+      JOIN nonequi_dup_b b ON a.id = b.id AND a.value > b.threshold
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate and Duplicates Result ===")
+    result.show()
+
+    // Expected: (1, 200, 1, 150) and (2, 150, 2, 100) = 2 rows
+    val count = result.collect().length
+    println(s"Join with non-equi + duplicates result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  test("join with non-equi predicate - right side indexed") {
+    // Test: non-equi predicate when right side is indexed
+    val dfA = Seq(
+      (1, 100),
+      (2, 200),
+      (3, 50)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 80), // value(100) > 80 = true
+      (2, 250), // value(200) > 250 = false
+      (3, 40) // value(50) > 40 = true
+    ).toDF("id", "threshold")
+
+    val indexedB = dfB.createIndex(0).cache()
+
+    dfA.createOrReplaceTempView("nonequi_right_a")
+    indexedB.createOrReplaceTempView("nonequi_right_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_right_a a
+      JOIN nonequi_right_b b ON a.id = b.id AND a.value > b.threshold
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate (Right Indexed) Result ===")
+    result.show()
+
+    // Expected: id=1 and id=3
+    val count = result.collect().length
+    println(s"Join with non-equi (right indexed) result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  test("join with non-equi predicate - no matches") {
+    // Test: non-equi predicate filters out all equi-join matches
+    val dfA = Seq(
+      (1, 10),
+      (2, 20)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 100), // value(10) > 100 = false
+      (2, 200) // value(20) > 200 = false
+    ).toDF("id", "threshold")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_nomatch_a")
+    dfB.createOrReplaceTempView("nonequi_nomatch_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_nomatch_a a
+      JOIN nonequi_nomatch_b b ON a.id = b.id AND a.value > b.threshold
+    """)
+
+    result.explain(true)
+    println("=== Join with Non-Equi Predicate (No Matches) Result ===")
+    result.show()
+
+    // Expected: 0 rows (all filtered by non-equi predicate)
+    val count = result.collect().length
+    println(s"Join with non-equi (no matches) result: $count rows (expected: 0)")
+    assert(count == 0, s"Expected 0 rows but got $count")
+  }
+
+  test("join with BETWEEN-like non-equi predicate") {
+    // Test: a.value BETWEEN b.min_val AND b.max_val
+    val dfA = Seq(
+      (1, 50),
+      (2, 150),
+      (3, 250)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 0, 100), // value(50) between 0 and 100 = true
+      (2, 100, 200), // value(150) between 100 and 200 = true
+      (3, 300, 400) // value(250) between 300 and 400 = false
+    ).toDF("id", "min_val", "max_val")
+
+    val indexedA = dfA.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("nonequi_between_a")
+    dfB.createOrReplaceTempView("nonequi_between_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM nonequi_between_a a
+      JOIN nonequi_between_b b ON a.id = b.id
+                              AND a.value >= b.min_val
+                              AND a.value <= b.max_val
+    """)
+
+    result.explain(true)
+    println("=== Join with BETWEEN-like Non-Equi Predicate Result ===")
+    result.show()
+
+    // Expected: id=1 and id=2
+    val count = result.collect().length
+    println(s"Join with BETWEEN-like predicate result: $count rows (expected: 2)")
+    assert(count == 2, s"Expected 2 rows but got $count")
   }
 }
