@@ -3,7 +3,7 @@ package indexeddataframe.execution
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, EqualTo, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, BindReferences, EqualTo, Expression, Literal}
 import indexeddataframe.{IRDD, InternalIndexedPartition, Utils}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.plans.physical._
@@ -179,21 +179,24 @@ case class IndexedFilterExec(condition: Expression, child: SparkPlan) extends Un
   }
 }
 
-/** physical operator to performed a shuffled equijoin between our indexed DataFrame and a regular DataFrame
-  * @param left
-  *   the indexed DataFrame
-  * @param right
-  *   a regular dataFrame
-  * @param leftCol
-  *   the number of the column on which the join is performed for the left table
-  * @param rightCol
-  *   the number of the column on which the join is performed for the right table
-  */
+/**
+ * Physical operator for shuffled equi-join between an indexed DataFrame and a regular DataFrame.
+ *
+ * This operator performs an equi-join using the index for efficient lookups, then applies
+ * any additional non-equi predicates (e.g., `a.value > b.threshold`) to filter the results.
+ *
+ * @param left            The indexed DataFrame (left side of join)
+ * @param right           A regular DataFrame (right side of join)
+ * @param leftCol         Column index for join key on the left table
+ * @param rightCol        Column index for join key on the right table
+ * @param otherPredicates Non-equi join predicates to apply after the equi-join
+ */
 case class IndexedShuffledEquiJoinExec(
     left: SparkPlan,
     right: SparkPlan,
     leftCol: Int,
-    rightCol: Int
+    rightCol: Int,
+    otherPredicates: Seq[Expression] = Seq.empty
 ) extends BinaryExecNode {
   private val logger = LoggerFactory.getLogger(classOf[IndexedShuffledEquiJoinExec])
 
@@ -209,6 +212,30 @@ case class IndexedShuffledEquiJoinExec(
       newChildren: IndexedSeq[SparkPlan]
   ): IndexedShuffledEquiJoinExec =
     copy(left = newChildren(0), right = newChildren(1))
+
+  /**
+   * Applies non-equi predicates to filter joined rows.
+   *
+   * Binds the predicate expressions to the output schema and evaluates them
+   * for each row. Only rows satisfying all predicates are returned.
+   */
+  private def applyOtherPredicates(result: RDD[InternalRow]): RDD[InternalRow] = {
+    if (otherPredicates.isEmpty) {
+      result
+    } else {
+      val outputAttrs = output
+      val predicates = otherPredicates
+      result.mapPartitions { iter =>
+        // Bind predicates to output schema inside the partition
+        val boundPredicates = predicates.map { pred =>
+          BindReferences.bindReference(pred, outputAttrs)
+        }
+        iter.filter { row =>
+          boundPredicates.forall(_.eval(row).asInstanceOf[Boolean])
+        }
+      }
+    }
+  }
 
   // helper method to find the IndexedOperatorExec in the plan tree
   private def findIndexedOp(plan: SparkPlan): Option[IndexedOperatorExec] = {
@@ -232,56 +259,66 @@ case class IndexedShuffledEquiJoinExec(
     val useLeftIndex = leftIndexedOp.exists(op => op.indexColNo == leftCol)
     val useRightIndex = rightIndexedOp.exists(op => op.indexColNo == rightCol)
 
-    (useLeftIndex, useRightIndex, leftIndexedOp, rightIndexedOp) match {
-      case (true, _, Some(indexedLeft), _) => {
+    val equiJoinResult = (useLeftIndex, useRightIndex, leftIndexedOp, rightIndexedOp) match {
+      case (true, _, Some(indexedLeft), _) =>
         val leftRDD = indexedLeft.executeIndexed()
         val rightRDD = right.execute()
 
-        val result = leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
+        leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
           // generate an unsafe row joiner
           // Note: InternalIndexedPartition.get() returns rows WITHOUT prev column
           val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
           if (leftIter.hasNext) {
-            val result = leftIter.next().multigetJoinedRight(rightIter, joiner, right.output, rightCol)
-            result
+            leftIter.next().multigetJoinedRight(rightIter, joiner, right.output, rightCol)
           } else Iterator.empty
         }
-        result
-      }
-      case (_, true, _, Some(indexedRight)) => {
+
+      case (_, true, _, Some(indexedRight)) =>
         val leftRDD = left.execute()
         val rightRDD = indexedRight.executeIndexed()
 
-        val result = rightRDD.partitionsRDD.zipPartitions(leftRDD, true) { (rightIter, leftIter) =>
+        rightRDD.partitionsRDD.zipPartitions(leftRDD, true) { (rightIter, leftIter) =>
           // generate an unsafe row joiner
           // Note: InternalIndexedPartition.get() returns rows WITHOUT prev column
           val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
           if (rightIter.hasNext) {
-            val result = rightIter.next().multigetJoinedLeft(leftIter, joiner, left.output, leftCol)
-            result
+            rightIter.next().multigetJoinedLeft(leftIter, joiner, left.output, leftCol)
           } else Iterator.empty
         }
-        result
-      }
+
       case _ =>
         throw new IllegalStateException(
           s"IndexedShuffleEquiJoinExec requires at least one indexed child where join column matches index column. " +
             s"leftCol=$leftCol, rightCol=$rightCol, leftIndexColNo=${leftIndexedOp.map(_.indexColNo)}, rightIndexColNo=${rightIndexedOp.map(_.indexColNo)}"
         )
     }
+
+    // Apply non-equi predicates (e.g., a.value > b.threshold) after the equi-join
+    applyOtherPredicates(equiJoinResult)
   }
 
 }
 
-/** physical operator that performs a broadcast equi join between an indexed DataFrame and a regular DataFrame
-  * @param left
-  *   the indexed DataFrame
-  * @param right
-  *   a regular DataFrame
-  * @param leftCol
-  * @param rightCol
-  */
-case class IndexedBroadcastEquiJoinExec(left: SparkPlan, right: SparkPlan, leftCol: Int, rightCol: Int) extends BinaryExecNode {
+/**
+ * Physical operator for broadcast equi-join between an indexed DataFrame and a regular DataFrame.
+ *
+ * This operator broadcasts the smaller (right) side to all partitions and uses the index
+ * on the left side for efficient lookups. Any additional non-equi predicates are applied
+ * after the equi-join.
+ *
+ * @param left            The indexed DataFrame (left side of join)
+ * @param right           A regular DataFrame to be broadcast (right side of join)
+ * @param leftCol         Column index for join key on the left table
+ * @param rightCol        Column index for join key on the right table
+ * @param otherPredicates Non-equi join predicates to apply after the equi-join
+ */
+case class IndexedBroadcastEquiJoinExec(
+    left: SparkPlan,
+    right: SparkPlan,
+    leftCol: Int,
+    rightCol: Int,
+    otherPredicates: Seq[Expression] = Seq.empty
+) extends BinaryExecNode {
   private val logger = LoggerFactory.getLogger(classOf[IndexedBroadcastEquiJoinExec])
 
   override def output: Seq[Attribute] = left.output ++ right.output
@@ -290,6 +327,26 @@ case class IndexedBroadcastEquiJoinExec(left: SparkPlan, right: SparkPlan, leftC
       newChildren: IndexedSeq[SparkPlan]
   ): IndexedBroadcastEquiJoinExec =
     copy(left = newChildren(0), right = newChildren(1))
+
+  /**
+   * Applies non-equi predicates to filter joined rows.
+   */
+  private def applyOtherPredicates(result: RDD[InternalRow]): RDD[InternalRow] = {
+    if (otherPredicates.isEmpty) {
+      result
+    } else {
+      val outputAttrs = output
+      val predicates = otherPredicates
+      result.mapPartitions { iter =>
+        val boundPredicates = predicates.map { pred =>
+          BindReferences.bindReference(pred, outputAttrs)
+        }
+        iter.filter { row =>
+          boundPredicates.forall(_.eval(row).asInstanceOf[Boolean])
+        }
+      }
+    }
+  }
 
   override def doExecute(): RDD[InternalRow] = {
     logger.debug("in the Broadcast JOIN operator")
@@ -305,7 +362,9 @@ case class IndexedBroadcastEquiJoinExec(left: SparkPlan, right: SparkPlan, leftC
 
     logger.debug("collect + broadcast time = %f".format((t2 - t1) / 1000000.0))
 
-    val result = leftRDD.multigetBroadcast(rightRDD, leftSchema, rightSchema, right.output, rightCol)
-    result
+    val equiJoinResult = leftRDD.multigetBroadcast(rightRDD, leftSchema, rightSchema, right.output, rightCol)
+
+    // Apply non-equi predicates after the equi-join
+    applyOtherPredicates(equiJoinResult)
   }
 }

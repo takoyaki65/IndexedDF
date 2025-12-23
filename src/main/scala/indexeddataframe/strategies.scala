@@ -27,15 +27,23 @@ object IndexedOperators extends SparkStrategy {
     case IndexedFilter(condition, child) => IndexedFilterExec(condition, planLater(child)) :: Nil
     case IndexedJoin(left, right, joinType, condition) =>
       Join(left, right, joinType, condition, JoinHint.NONE) match {
-        case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, lChild, rChild, _) => {
+        case ExtractEquiJoinKeys(_, leftKeys, rightKeys, otherPredicates, _, lChild, rChild, _) =>
           // compute the index of the left side keys == column number
           // Use semanticEquals to compare attributes as they may have different metadata
           val leftColNo = lChild.output.indexWhere(_.semanticEquals(leftKeys.head))
           // compute the index of the right side keys == column number
           val rightColNo = rChild.output.indexWhere(_.semanticEquals(rightKeys.head))
 
-          IndexedShuffledEquiJoinExec(planLater(left), planLater(right), leftColNo, rightColNo) :: Nil
-        }
+          // Pass otherPredicates (non-equi join conditions like a.value > b.threshold)
+          // to the physical operator for post-join filtering
+          // otherPredicates is Option[Expression], convert to Seq[Expression]
+          IndexedShuffledEquiJoinExec(
+            planLater(left),
+            planLater(right),
+            leftColNo,
+            rightColNo,
+            otherPredicates.toSeq
+          ) :: Nil
         case _ => Nil
       }
     case _ => Nil
