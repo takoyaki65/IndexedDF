@@ -13,24 +13,125 @@ import org.slf4j.LoggerFactory
 
 import scala.collection.concurrent.TrieMap
 
+/**
+ * Catalyst optimization rules for Indexed DataFrame operations.
+ *
+ * == Overview ==
+ *
+ * This file contains optimization rules that transform standard Spark logical plans
+ * into indexed operations when applicable. These rules are registered via:
+ * {{{
+ *   sparkSession.experimental.extraOptimizations ++= Seq(ConvertToIndexedOperators)
+ * }}}
+ *
+ * == Rule Execution Order ==
+ *
+ * {{{
+ *   Standard LogicalPlan (Join, Filter, etc.)
+ *            │
+ *            ▼
+ *   ConvertToIndexedOperators (this file)
+ *            │
+ *            ├─ Detects InMemoryRelation with IndexedOperatorExec
+ *            │  └─▶ Converts to IndexedBlockRDD
+ *            │
+ *            ├─ Detects Join on indexed column
+ *            │  └─▶ Converts to IndexedJoin
+ *            │
+ *            └─ Detects Filter on indexed column
+ *               └─▶ Converts to IndexedFilter
+ * }}}
+ *
+ * == Cache Management ==
+ *
+ * The rules maintain a cache (via TrieMap) of already-executed indexed plans
+ * to avoid redundant computation when the same indexed data is accessed multiple times.
+ */
+
+// =============================================================================
+// Local Relation Indexing Rule
+// =============================================================================
+
+/**
+ * Rule for indexing local (in-driver) relations.
+ *
+ * Transforms CreateIndex on a LocalRelation into an IndexedLocalRelation.
+ * This is primarily used for testing with small datasets.
+ *
+ * == Transformation ==
+ *
+ * {{{
+ *   CreateIndex(colNo, LocalRelation(output, data))
+ *            │
+ *            ▼
+ *   IndexedLocalRelation(output, data)
+ * }}}
+ * 
+ * @note It isn't used. should be removed?
+ */
 object IndexLocalRelation extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = plan transform { case CreateIndex(colNo, lr: LocalRelation) =>
     IndexedLocalRelation(lr.output, lr.data)
   }
 }
 
-/** set of rules to be applied for Indexed Data Frames
-  */
+// =============================================================================
+// Main Optimization Rule
+// =============================================================================
+
+/**
+ * Main optimization rule for converting standard Spark operators to indexed operators.
+ *
+ * This rule is the core of the Indexed DataFrame optimization. It detects patterns
+ * in the logical plan that can benefit from indexing and transforms them accordingly.
+ *
+ * == Supported Transformations ==
+ *
+ * 1. '''Cache Detection''': Converts InMemoryRelation with indexed child to IndexedBlockRDD
+ * 2. '''Indexed Join''': Converts equi-join on indexed column to IndexedJoin (INNER only)
+ * 3. '''Indexed Filter''': Converts equality filter on indexed column to IndexedFilter
+ * 4. '''IsNotNull Elimination''': Removes redundant IsNotNull checks on indexed data
+ *
+ * == Limitations ==
+ *
+ * - Only INNER JOIN is supported; other join types fall back to Spark's default
+ * - Only single-column indexes are supported; composite keys are not supported
+ * - Filter optimization only applies to equality conditions (not range queries)
+ *
+ * == Registration ==
+ *
+ * {{{
+ *   sparkSession.experimental.extraOptimizations ++= Seq(ConvertToIndexedOperators)
+ * }}}
+ */
 object ConvertToIndexedOperators extends Rule[LogicalPlan] {
 
-  /** we need to keep track of which indexed data has been cached, much like Spark SQL's [CacheManager]
-    */
+  // ===========================================================================
+  // Cache Management
+  // ===========================================================================
+
+  /**
+   * Cache for already-executed indexed plans.
+   *
+   * Similar to Spark SQL's CacheManager, this tracks which indexed data has been
+   * materialized to avoid redundant computation. Uses CTrie for thread-safety.
+   *
+   * Key: The SparkPlan that produced the indexed data
+   * Value: The resulting IRDD (RDD of InternalIndexedPartition)
+   */
   private val cachedPlan: TrieMap[SparkPlan, IRDD] = new TrieMap[SparkPlan, IRDD]
 
-  /** check if a physical plan has already been cached; if so, return it, otherwise cache it
-    * @param plan
-    * @return
-    */
+  /**
+   * Retrieves cached indexed data or executes and caches the plan.
+   *
+   * This implements a simple cache-aside pattern:
+   * 1. Check if the plan is already cached
+   * 2. If not, execute the plan and cache the result
+   * 3. Return the cached IRDD
+   *
+   * @param plan The physical plan to execute or retrieve from cache
+   * @return The IRDD containing indexed partition data
+   */
   private def getIfCached(plan: SparkPlan): IRDD = {
     val result = cachedPlan.get(plan)
     if (result == None) {
@@ -42,10 +143,16 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     }
   }
 
-  /** check if a logical plan is constructed with indexed operators
-    * @param plan
-    * @return
-    */
+  // ===========================================================================
+  // Index Detection Utilities
+  // ===========================================================================
+
+  /**
+   * Checks if a logical plan contains indexed operators.
+   *
+   * @param plan The logical plan to check
+   * @return true if any node in the plan tree is an IndexedOperator
+   */
   def isIndexed(plan: LogicalPlan): Boolean = {
     plan.find {
       case _: IndexedOperator => true
@@ -53,10 +160,12 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     }.nonEmpty
   }
 
-  /** check if a physical plan is constructed with indexed operators
-    * @param plan
-    * @return
-    */
+  /**
+   * Checks if a physical plan contains indexed operators.
+   *
+   * @param plan The physical plan to check
+   * @return true if any node in the plan tree is an IndexedOperatorExec
+   */
   def isIndexed(plan: SparkPlan): Boolean = {
     plan.find {
       case _: IndexedOperatorExec => true
@@ -64,73 +173,152 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     }.nonEmpty
   }
 
-  /** Helper method to check if we are joining on an indexed column
-    * @param left
-    * @param right
-    * @param joinType
-    * @param condition
-    * @return
-    */
+  // ===========================================================================
+  // Join Condition Validation
+  // ===========================================================================
+
+  /**
+   * Checks if a join can use the left side's index.
+   *
+   * For a join to use the left side's index:
+   * 1. The left side must be an IndexedBlockRDD
+   * 2. The join must be an equi-join on exactly one column
+   * 3. The join column must be the indexed column
+   *
+   * == Example ==
+   *
+   * {{{
+   *   -- This can use indexed join (assuming 'id' is indexed on left)
+   *   SELECT * FROM indexed_table JOIN other ON indexed_table.id = other.id
+   *
+   *   -- This CANNOT use indexed join (composite key)
+   *   SELECT * FROM indexed_table JOIN other
+   *     ON indexed_table.id = other.id AND indexed_table.name = other.name
+   * }}}
+   *
+   * @param left      The left side of the join (must be IndexedBlockRDD)
+   * @param right     The right side of the join
+   * @param joinType  The type of join
+   * @param condition The join condition
+   * @return true if the join can use the left side's index
+   */
   def joiningIndexedColumnLeft(left: IndexedBlockRDD, right: LogicalPlan, joinType: JoinType, condition: Option[Expression]): Boolean = {
     Join(left, right, joinType, condition, JoinHint.NONE) match {
       case ExtractEquiJoinKeys(_, leftKeys, _, _, _, lChild, _, _) =>
         // Only support single-key joins; composite keys are not supported by IndexedJoin
         if (leftKeys.length != 1) return false
-        var leftColNo = 0
-        var i = 0
-        lChild.output.foreach(col => {
-          if (col == leftKeys(0)) leftColNo = i
-          i += 1
-        })
-        leftColNo == left.asInstanceOf[IndexedBlockRDD].rdd.colNo
+        val leftColNo = lChild.output.indexWhere(_.semanticEquals(leftKeys.head))
+        leftColNo == left.rdd.colNo
       case _ => false
     }
   }
 
+  /**
+   * Checks if a join can use the right side's index.
+   *
+   * Same logic as [[joiningIndexedColumnLeft]] but for the right side.
+   *
+   * @param left      The left side of the join
+   * @param right     The right side of the join (must be IndexedBlockRDD)
+   * @param joinType  The type of join
+   * @param condition The join condition
+   * @return true if the join can use the right side's index
+   */
   def joiningIndexedColumnRight(left: LogicalPlan, right: IndexedBlockRDD, joinType: JoinType, condition: Option[Expression]): Boolean = {
     Join(left, right, joinType, condition, JoinHint.NONE) match {
+      // Extract equi-join keys from the join condition
       case ExtractEquiJoinKeys(_, _, rightKeys, _, _, _, rChild, _) =>
         // Only support single-key joins; composite keys are not supported by IndexedJoin
         if (rightKeys.length != 1) return false
-        var rightColNo = 0
-        var i = 0
-        rChild.output.foreach(col => {
-          if (col == rightKeys(0)) rightColNo = i
-          i += 1
-        })
-        rightColNo == right.asInstanceOf[IndexedBlockRDD].rdd.colNo
+        val rightColNo = rChild.output.indexWhere(_.semanticEquals(rightKeys.head))
+        rightColNo == right.rdd.colNo
       case _ => false
     }
   }
 
-  def filterIndexedColumn(child: IndexedBlockRDD, attributeReference: AttributeReference): Boolean = {
+  // ===========================================================================
+  // Filter Condition Validation
+  // ===========================================================================
 
+  /**
+   * Checks if a filter condition targets the indexed column.
+   *
+   * For index-based filtering to apply, the filter must be on the same column
+   * that was used to create the index.
+   *
+   * @param child             The indexed data being filtered
+   * @param attributeReference The column being filtered on
+   * @return true if the filter is on the indexed column
+   */
+  def filterIndexedColumn(child: IndexedBlockRDD, attributeReference: AttributeReference): Boolean = {
     val indexedColNo = child.rdd.colNo
     val indexedAttrRef = child.output(indexedColNo)
     attributeReference.exprId == indexedAttrRef.exprId
   }
 
+  /**
+   * Checks if join and filter conditions reference the same columns.
+   *
+   * Used for optimizing patterns like:
+   * {{{
+   *   SELECT * FROM a JOIN b ON a.id = b.id
+   *   WHERE a.id = 123 AND b.id = 123
+   * }}}
+   *
+   * @param joinCondition  The join equality condition
+   * @param leftCondition  The filter condition on the left side
+   * @param rightCondition The filter condition on the right side
+   * @return true if all conditions reference the same columns
+   */
   def joinSameFilterColumns(joinCondition: EqualTo, leftCondition: EqualTo, rightCondition: EqualTo): Boolean = {
     joinCondition.left == leftCondition.left && joinCondition.right == rightCondition.left
   }
 
+  // ===========================================================================
+  // Plan Transformation Rules
+  // ===========================================================================
+
+  /**
+   * Applies transformation rules to convert standard operators to indexed operators.
+   *
+   * Uses `transformUp` to process the plan bottom-up, ensuring child nodes
+   * are transformed before their parents.
+   */
   def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
-    /** replace Spark's default .cache() method with our own cache implementation for indexed data frames
-      */
+
+    // -------------------------------------------------------------------------
+    // Rule 1: Cache Detection
+    // -------------------------------------------------------------------------
+    // Converts InMemoryRelation (Spark's cache representation) with an indexed
+    // child into IndexedBlockRDD for subsequent indexed operations.
+
     case InMemoryRelationMatcher(output, _, child: IndexedOperatorExec) =>
       IndexedBlockRDD(output, getIfCached(child), child)
 
-    /** apply indexed join only on indexed data (Inner Join only) Semi-Join, Anti-Join, Outer-Join are not supported and will fallback to Spark's
-      * default join TODO: support other join types
-      */
+    // -------------------------------------------------------------------------
+    // Rule 2: Indexed Join (Left Side Indexed)
+    // -------------------------------------------------------------------------
+    // Converts equi-join to IndexedJoin when the left side is indexed.
+    // Only INNER JOIN is supported; other join types fall back to Spark's default.
+
     case Join(left: IndexedBlockRDD, right, joinType @ Inner, condition, _) if joiningIndexedColumnLeft(left, right, joinType, condition) =>
       IndexedJoin(left.asInstanceOf[IndexedOperator], right, joinType, condition)
+
+    // -------------------------------------------------------------------------
+    // Rule 3: Indexed Join (Right Side Indexed)
+    // -------------------------------------------------------------------------
+    // Converts equi-join to IndexedJoin when the right side is indexed.
 
     case Join(left, right: IndexedBlockRDD, joinType @ Inner, condition, _) if joiningIndexedColumnRight(left, right, joinType, condition) =>
       IndexedJoin(left, right.asInstanceOf[IndexedOperator], joinType, condition)
 
-    /** apply indexed filtering only on filtered data
-      */
+    // -------------------------------------------------------------------------
+    // Rule 4: IsNotNull Elimination
+    // -------------------------------------------------------------------------
+    // Removes redundant IsNotNull checks on indexed data.
+    // Since indexed data is already validated during index creation,
+    // these null checks are unnecessary.
+
     case Filter(IsNotNull(attr: AttributeReference), child: IndexedBlockRDD) =>
       child
 
@@ -140,8 +328,20 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     case Filter(And(IsNotNull(attr: AttributeReference), right), child: IndexedBlockRDD) =>
       Filter(right, child)
 
+    // -------------------------------------------------------------------------
+    // Rule 5: Indexed Filter
+    // -------------------------------------------------------------------------
+    // Converts equality filter on indexed column to IndexedFilter.
+    // This enables O(1) lookup instead of full scan.
+
     case Filter(condition @ EqualTo(attr: AttributeReference, _), child: IndexedBlockRDD) if filterIndexedColumn(child, attr) =>
       IndexedFilter(condition, child.asInstanceOf[IndexedOperator])
+
+    // -------------------------------------------------------------------------
+    // Rule 6: Filter-Join Optimization
+    // -------------------------------------------------------------------------
+    // Optimizes joins where both sides have equality filters on the join column.
+    // This pattern occurs with parameterized queries joining on indexed columns.
 
     case Join(
           left @ IndexedFilter(conditionLeft: EqualTo, _),
