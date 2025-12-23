@@ -1,7 +1,7 @@
 package indexeddataframe
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.types._
 import scala.collection.concurrent.TrieMap
 import org.apache.spark.sql.catalyst.expressions.codegen.UnsafeRowJoiner
@@ -207,9 +207,10 @@ class InternalIndexedPartition extends Serializable {
   @transient private var backwardPointerJoiner: CustomUnsafeRowJoiner = null
 
   /**
-   * Projection for converting InternalRow to UnsafeRow if needed.
+   * Projection for removing the #prev column from rows returned by get().
+   * Takes a row with (original columns + prev) and projects to (original columns only).
    */
-  @transient private var convertToUnsafe: UnsafeProjection = null
+  @transient private var removePrevProjection: UnsafeProjection = null
 
   // =====================================================================================
   // Initialization and setup
@@ -262,8 +263,14 @@ class InternalIndexedPartition extends Serializable {
     // Generate code for joining rows with the #prev column
     this.backwardPointerJoiner = GenerateCustomUnsafeRowJoiner.create(schema, rightSchema)
 
-    // Initialize projection for converting to UnsafeRow if needed
-    this.convertToUnsafe = UnsafeProjection.create(schema)
+    // Create projection to remove #prev column when returning rows from get()
+    // Input schema: original columns + prev, Output schema: original columns only
+    // Use BoundReference to specify which columns to project from the input row
+    val schemaWithPrev = schema.add(rightField)
+    val projectionExprs = (0 until nColumns).map { i =>
+      BoundReference(i, schemaWithPrev(i).dataType, schemaWithPrev(i).nullable)
+    }
+    this.removePrevProjection = UnsafeProjection.create(projectionExprs)
   }
 
   // =====================================================================================
@@ -525,11 +532,14 @@ class InternalIndexedPartition extends Serializable {
   /**
    * Iterator that traverses all rows with the same key using backward pointers.
    *
+   * Returns rows WITHOUT the internal #prev column - the prev pointer is used
+   * internally for traversal but is not exposed to callers.
+   *
    * @param startPointer Initial encoded pointer from the index
    */
   class AddressRowIterator(startPointer: Long) extends Iterator[InternalRow] {
-    // Reusable UnsafeRow for returning results (includes #prev column)
-    private val currentRow = new UnsafeRow(schema.size + 1)
+    // Reusable UnsafeRow for reading data (includes #prev column for traversal)
+    private val rowWithPrev = new UnsafeRow(schema.size + 1)
     // Current encoded pointer in the linked list
     private var currentPointer = startPointer
 
@@ -548,12 +558,13 @@ class InternalIndexedPartition extends Serializable {
 
       // Point to the row data (after the size header)
       val rowDataOffset = Platform.BYTE_ARRAY_OFFSET + offsetInPage + RowSizeHeaderBytes
-      currentRow.pointTo(page, rowDataOffset, size)
+      rowWithPrev.pointTo(page, rowDataOffset, size)
 
       // Follow the backward pointer to the next row with the same key
-      currentPointer = currentRow.getLong(nColumns)
+      currentPointer = rowWithPrev.getLong(nColumns)
 
-      currentRow
+      // Project to remove #prev column before returning
+      removePrevProjection(rowWithPrev)
     }
   }
 

@@ -7,7 +7,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Equal
 import indexeddataframe.{IRDD, InternalIndexedPartition, Utils}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
+import org.apache.spark.sql.types.{StructField, StructType}
 import org.slf4j.LoggerFactory
 
 trait LeafExecNode extends SparkPlan {
@@ -239,9 +239,8 @@ case class IndexedShuffledEquiJoinExec(
 
         val result = leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
           // generate an unsafe row joiner
-          // Create a copy of leftSchema to avoid mutating the original
-          val leftSchemaWithPrev = leftSchema.add("prev", IntegerType)
-          val joiner = GenerateUnsafeRowJoiner.create(leftSchemaWithPrev, rightSchema)
+          // Note: InternalIndexedPartition.get() returns rows WITHOUT prev column
+          val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
           if (leftIter.hasNext) {
             val result = leftIter.next().multigetJoinedRight(rightIter, joiner, right.output, rightCol)
             result
@@ -255,9 +254,8 @@ case class IndexedShuffledEquiJoinExec(
 
         val result = rightRDD.partitionsRDD.zipPartitions(leftRDD, true) { (rightIter, leftIter) =>
           // generate an unsafe row joiner
-          // Create a copy of rightSchema to avoid mutating the original
-          val rightSchemaWithPrev = rightSchema.add("prev", IntegerType)
-          val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchemaWithPrev)
+          // Note: InternalIndexedPartition.get() returns rows WITHOUT prev column
+          val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
           if (rightIter.hasNext) {
             val result = rightIter.next().multigetJoinedLeft(leftIter, joiner, left.output, leftCol)
             result
