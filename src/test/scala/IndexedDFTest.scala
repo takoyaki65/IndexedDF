@@ -1669,17 +1669,23 @@ class IndexedDFTest extends AnyFunSuite {
     diskIndexed.createOrReplaceTempView("disk_indexed")
     dfJoin.createOrReplaceTempView("join_table")
 
-    val memoryJoinResult = sparkSession.sql("""
+    val memoryJoinResult = sparkSession
+      .sql("""
       SELECT memory_indexed.id, value, extra FROM memory_indexed
       JOIN join_table ON memory_indexed.id = join_table.id
       ORDER BY memory_indexed.id, value
-    """).collect().map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+    """)
+      .collect()
+      .map(r => (r.getInt(0), r.getString(1), r.getString(2)))
 
-    val diskJoinResult = sparkSession.sql("""
+    val diskJoinResult = sparkSession
+      .sql("""
       SELECT disk_indexed.id, value, extra FROM disk_indexed
       JOIN join_table ON disk_indexed.id = join_table.id
       ORDER BY disk_indexed.id, value
-    """).collect().map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+    """)
+      .collect()
+      .map(r => (r.getInt(0), r.getString(1), r.getString(2)))
 
     assert(memoryJoinResult.sameElements(diskJoinResult), "Join results should be identical for MEMORY_ONLY and DISK_ONLY")
 
@@ -1687,5 +1693,301 @@ class IndexedDFTest extends AnyFunSuite {
 
     memoryIndexed.unpersist()
     diskIndexed.unpersist()
+  }
+
+  // ============================================
+  // Rule 6: Filter-Join Optimization tests
+  // Tests for the joinSameFilterColumns optimization rule
+  // ============================================
+
+  test("Rule 6 - join with equality filters on both sides (same value)") {
+    // This is the pattern Rule 6 is designed to optimize:
+    // SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id = 123 AND b.id = 123
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_a")
+    indexedB.createOrReplaceTempView("rule6_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_a a
+      JOIN rule6_b b ON a.id = b.id
+      WHERE a.id = 2 AND 2 = b.id
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Same Value Filters Result ===")
+    result.show()
+
+    val collected = result.collect()
+    // Should return exactly 1 row: (2, a2, 2, b2)
+    assert(collected.length == 1, s"Expected 1 row but got ${collected.length}")
+    assert(collected(0).getInt(0) == 2, "Expected id=2")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
+  }
+
+  test("Rule 6 - join with equality filters on both sides (different values)") {
+    // This tests a potential bug: a.id = 2 AND b.id = 3 should return 0 rows
+    // because the join condition a.id = b.id cannot be satisfied
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_diff_a")
+    indexedB.createOrReplaceTempView("rule6_diff_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_diff_a a
+      JOIN rule6_diff_b b ON a.id = b.id
+      WHERE a.id = 2 AND b.id = 3
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Different Value Filters Result ===")
+    result.show()
+
+    val collected = result.collect()
+    // Should return 0 rows because a.id = b.id AND a.id = 2 AND b.id = 3 is impossible
+    assert(collected.length == 0, s"Expected 0 rows but got ${collected.length} - Rule 6 may have incorrectly dropped a filter")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
+  }
+
+  test("Rule 6 - filter only on left side") {
+    // Only left side has filter, Rule 6 should NOT apply
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_left_only_a")
+    indexedB.createOrReplaceTempView("rule6_left_only_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_left_only_a a
+      JOIN rule6_left_only_b b ON a.id = b.id
+      WHERE a.id = 2
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Left Filter Only Result ===")
+    result.show()
+
+    val collected = result.collect()
+    // Should return 1 row: (2, a2, 2, b2)
+    assert(collected.length == 1, s"Expected 1 row but got ${collected.length}")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
+  }
+
+  test("Rule 6 - inequality filters should not trigger Rule 6") {
+    // Rule 6 only applies to EqualTo, not LessThan/GreaterThan
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_ineq_a")
+    indexedB.createOrReplaceTempView("rule6_ineq_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_ineq_a a
+      JOIN rule6_ineq_b b ON a.id = b.id
+      WHERE a.id < 3 AND b.id < 3
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Inequality Filters Result ===")
+    result.show()
+
+    val collected = result.collect()
+    // Should return 2 rows: id=1 and id=2
+    assert(collected.length == 2, s"Expected 2 rows but got ${collected.length}")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
+  }
+
+  test("Rule 6 - mixed equality and inequality filters") {
+    // a.id = 2 AND b.id < 5 - Rule 6 should NOT apply (different filter types)
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2"),
+      (3, "b3")
+    ).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_mixed_a")
+    indexedB.createOrReplaceTempView("rule6_mixed_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_mixed_a a
+      JOIN rule6_mixed_b b ON a.id = b.id
+      WHERE a.id = 2 AND b.id < 5
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Mixed Filters Result ===")
+    result.show()
+
+    val collected = result.collect()
+    // Should return 1 row: (2, a2, 2, b2) because a.id=2 AND b.id<5 AND a.id=b.id
+    assert(collected.length == 1, s"Expected 1 row but got ${collected.length}")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
+  }
+
+  // =============================================================================
+  // Rule 5 and Rule 6: Reversed Literal Form Tests (lit = attr instead of attr = lit)
+  // =============================================================================
+
+  test("Rule 5 - filter with reversed literal form (lit = attr)") {
+    // Test that Rule 5 handles WHERE 1234 = src (instead of src = 1234)
+    val df = Seq((1234, 12345, "abcd"), (1234, 12, "abcde"), (1237, 120, "abcdef")).toDF("src", "dst", "tag")
+    val indexedDf = df.createIndex(0).cache()
+    indexedDf.createOrReplaceTempView("rule5_reversed_test")
+
+    // Use reversed literal form: 1234 = src instead of src = 1234
+    val result = sparkSession.sql("SELECT * FROM rule5_reversed_test WHERE 1234 = src")
+
+    result.explain(true)
+    println("=== Rule 5 - Reversed Literal Form Result ===")
+    result.show()
+
+    // Verify IndexedFilter is used in the plan
+    val planStr = result.queryExecution.optimizedPlan.toString
+    assert(planStr.contains("IndexedFilter") || planStr.contains("IndexedBlockRDD"),
+      s"Expected IndexedFilter or IndexedBlockRDD in plan for reversed literal form, but got: $planStr")
+
+    val collected = result.collect()
+    assert(collected.length == 2, s"Expected 2 rows but got ${collected.length}")
+
+    indexedDf.unpersist()
+  }
+
+  test("Rule 6 - join with reversed literal filters (lit = attr on both sides)") {
+    // Test that Rule 6 handles WHERE 2 = a.id AND 2 = b.id (instead of a.id = 2 AND b.id = 2)
+    val dfA = Seq((1, "a1"), (2, "a2"), (3, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2"), (3, "b3")).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_rev_a")
+    indexedB.createOrReplaceTempView("rule6_rev_b")
+
+    // Use reversed literal form: 2 = a.id AND 2 = b.id
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_rev_a a
+      JOIN rule6_rev_b b ON a.id = b.id
+      WHERE 2 = a.id AND 2 = b.id
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Reversed Literal Form Result ===")
+    result.show()
+
+    // Verify IndexedFilter is used in the plan (Rule 5 should convert the filters)
+    val planStr = result.queryExecution.optimizedPlan.toString
+    assert(planStr.contains("IndexedFilter") || planStr.contains("IndexedJoin"),
+      s"Expected IndexedFilter or IndexedJoin in plan for reversed literal form, but got: $planStr")
+
+    val collected = result.collect()
+    assert(collected.length == 1, s"Expected 1 row but got ${collected.length}")
+    assert(collected(0).getInt(0) == 2, "Expected id=2")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
+  }
+
+  test("Rule 6 - join with mixed literal forms (attr = lit AND lit = attr)") {
+    // Test mixed forms: a.id = 2 AND 2 = b.id
+    val dfA = Seq((1, "a1"), (2, "a2"), (3, "a3")).toDF("id", "valA")
+    val dfB = Seq((1, "b1"), (2, "b2"), (3, "b3")).toDF("id", "valB")
+
+    val indexedA = dfA.createIndex(0).cache()
+    val indexedB = dfB.createIndex(0).cache()
+
+    indexedA.createOrReplaceTempView("rule6_mixed_form_a")
+    indexedB.createOrReplaceTempView("rule6_mixed_form_b")
+
+    // Mixed form: a.id = 2 AND 2 = b.id
+    val result = sparkSession.sql("""
+      SELECT * FROM rule6_mixed_form_a a
+      JOIN rule6_mixed_form_b b ON a.id = b.id
+      WHERE a.id = 2 AND 2 = b.id
+    """)
+
+    result.explain(true)
+    println("=== Rule 6 - Mixed Literal Forms Result ===")
+    result.show()
+
+    // Both should be converted to IndexedFilter
+    val planStr = result.queryExecution.optimizedPlan.toString
+    assert(planStr.contains("IndexedFilter") || planStr.contains("IndexedJoin"),
+      s"Expected IndexedFilter or IndexedJoin in plan for mixed literal form, but got: $planStr")
+
+    val collected = result.collect()
+    assert(collected.length == 1, s"Expected 1 row but got ${collected.length}")
+    assert(collected(0).getInt(0) == 2, "Expected id=2")
+
+    indexedA.unpersist()
+    indexedB.unpersist()
   }
 }

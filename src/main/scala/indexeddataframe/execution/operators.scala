@@ -166,15 +166,28 @@ case class IndexedFilterExec(condition: Expression, child: SparkPlan) extends Un
   ): IndexedFilterExec =
     copy(child = newChildren.head)
 
+  /**
+   * Extracts the Literal value from an EqualTo condition,
+   * handling both `attr = lit` and `lit = attr` forms.
+   */
+  private def extractLiteral(eq: EqualTo): Option[Literal] = {
+    eq match {
+      case EqualTo(_, lit: Literal) => Some(lit)
+      case EqualTo(lit: Literal, _) => Some(lit)
+      case _ => None
+    }
+  }
+
   override def doExecute(): RDD[InternalRow] = {
     condition match {
-      case EqualTo(_, literalValue: Literal) => {
-        val key = literalValue.value.asInstanceOf[AnyVal]
-        val rdd = child.asInstanceOf[IndexedOperatorExec].executeIndexed()
-        val resultRDD = rdd.get(key)
-
-        resultRDD
-      }
+      case eq: EqualTo =>
+        extractLiteral(eq) match {
+          case Some(literalValue) =>
+            val key = literalValue.value.asInstanceOf[AnyVal]
+            val rdd = child.asInstanceOf[IndexedOperatorExec].executeIndexed()
+            rdd.get(key)
+          case None => null
+        }
       case _ => null
     }
   }

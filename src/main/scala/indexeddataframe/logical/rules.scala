@@ -12,6 +12,7 @@ import org.apache.spark.sql.catalyst.plans.{Inner, JoinType}
 import org.slf4j.LoggerFactory
 
 import scala.collection.concurrent.TrieMap
+import org.apache.spark.sql.catalyst.expressions.Literal
 
 /**
  * Catalyst optimization rules for Indexed DataFrame operations.
@@ -152,6 +153,8 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
    *
    * @param plan The logical plan to check
    * @return true if any node in the plan tree is an IndexedOperator
+   * 
+   * @note This function is not used anywhere. Consider removing it.
    */
   def isIndexed(plan: LogicalPlan): Boolean = {
     plan.find {
@@ -165,6 +168,8 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
    *
    * @param plan The physical plan to check
    * @return true if any node in the plan tree is an IndexedOperatorExec
+   * 
+   * @note This function is not used anywhere. Consider removing it.
    */
   def isIndexed(plan: SparkPlan): Boolean = {
     plan.find {
@@ -257,6 +262,20 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
   }
 
   /**
+   * Extracts AttributeReference from the left or right side of an EqualTo.
+   *
+   * @param condition The EqualTo condition
+   * @return Some(attr) if either side is an AttributeReference, None otherwise
+   */
+  def extractAttrFromEquality(condition: EqualTo): Option[AttributeReference] = {
+    condition match {
+      case EqualTo(attr: AttributeReference, _) => Some(attr)
+      case EqualTo(_, attr: AttributeReference) => Some(attr)
+      case _                                    => None
+    }
+  }
+
+  /**
    * Checks if join and filter conditions reference the same columns.
    *
    * Used for optimizing patterns like:
@@ -265,13 +284,34 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
    *   WHERE a.id = 123 AND b.id = 123
    * }}}
    *
+   * Handles both `attr = lit` and `lit = attr` forms in filter conditions.
+   *
    * @param joinCondition  The join equality condition
    * @param leftCondition  The filter condition on the left side
    * @param rightCondition The filter condition on the right side
    * @return true if all conditions reference the same columns
    */
   def joinSameFilterColumns(joinCondition: EqualTo, leftCondition: EqualTo, rightCondition: EqualTo): Boolean = {
-    joinCondition.left == leftCondition.left && joinCondition.right == rightCondition.left
+    // Extract join column attributes (join condition should be attr = attr)
+    val joinLeftAttr = joinCondition.left match {
+      case attr: AttributeReference => Some(attr)
+      case _                        => None
+    }
+    val joinRightAttr = joinCondition.right match {
+      case attr: AttributeReference => Some(attr)
+      case _                        => None
+    }
+
+    // Extract filter attributes (handles both attr = lit and lit = attr)
+    val leftFilterAttr = extractAttrFromEquality(leftCondition)
+    val rightFilterAttr = extractAttrFromEquality(rightCondition)
+
+    // Check if left filter attr matches join left and right filter attr matches join right
+    (joinLeftAttr, joinRightAttr, leftFilterAttr, rightFilterAttr) match {
+      case (Some(jl), Some(jr), Some(lf), Some(rf)) =>
+        (jl.semanticEquals(lf) && jr.semanticEquals(rf)) || (jl.semanticEquals(rf) && jr.semanticEquals(lf))
+      case _ => false
+    }
   }
 
   // ===========================================================================
@@ -333,8 +373,12 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     // -------------------------------------------------------------------------
     // Converts equality filter on indexed column to IndexedFilter.
     // This enables O(1) lookup instead of full scan.
+    // Handles both `attr = lit` and `lit = attr` forms.
 
-    case Filter(condition @ EqualTo(attr: AttributeReference, _), child: IndexedBlockRDD) if filterIndexedColumn(child, attr) =>
+    case Filter(condition @ EqualTo(_: Literal, attr: AttributeReference), child: IndexedBlockRDD) if filterIndexedColumn(child, attr) =>
+      IndexedFilter(condition.withNewChildren(condition.children.reverse), child.asInstanceOf[IndexedOperator])
+
+    case Filter(condition @ EqualTo(attr: AttributeReference, _: Literal), child: IndexedBlockRDD) if filterIndexedColumn(child, attr) =>
       IndexedFilter(condition, child.asInstanceOf[IndexedOperator])
 
     // -------------------------------------------------------------------------
