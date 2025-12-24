@@ -3,7 +3,7 @@ package indexeddataframe.logical
 import indexeddataframe.execution.IndexedOperatorExec
 import indexeddataframe.{IRDD, Utils}
 import org.apache.spark.sql.InMemoryRelationMatcher
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, JoinHint, LocalRelation, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, JoinHint, LocalRelation, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, Expression, IsNotNull}
@@ -180,6 +180,59 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
   }
 
   // ===========================================================================
+  // Projection-through-IndexedBlockRDD Extractor
+  // ===========================================================================
+
+  /**
+   * Extractor object for detecting IndexedBlockRDD through optional Project layers.
+   *
+   * This enables indexed join optimizations even when Catalyst's ColumnPruning
+   * rule has inserted a Project between the IndexedBlockRDD and the Join.
+   *
+   * == Problem ==
+   *
+   * For queries like `SELECT COUNT(*) FROM indexed_table JOIN other ON ...`,
+   * Catalyst's ColumnPruning optimization inserts a Project to drop unused columns:
+   * {{{
+   *   Join
+   *   ├── Project [id]        <-- Inserted by ColumnPruning
+   *   │   └── IndexedBlockRDD
+   *   └── other
+   * }}}
+   *
+   * This breaks the pattern match `case Join(left: IndexedBlockRDD, ...)`.
+   *
+   * == Solution ==
+   *
+   * This extractor looks through Project layers to find the underlying IndexedBlockRDD:
+   * {{{
+   *   case ExtractIndexedBlockRDD(indexedRDD, Some(project)) => // Found through Project
+   *   case ExtractIndexedBlockRDD(indexedRDD, None) => // Direct IndexedBlockRDD
+   * }}}
+   */
+  object ExtractIndexedBlockRDD {
+
+    /**
+     * Extracts IndexedBlockRDD from a logical plan, looking through Project layers.
+     *
+     * @param plan The logical plan to extract from
+     * @return Some((IndexedBlockRDD, Option[Project])) if found, None otherwise.
+     *         The Option[Project] contains the outermost Project if present.
+     */
+    def unapply(plan: LogicalPlan): Option[(IndexedBlockRDD, Option[Project])] = plan match {
+      case indexed: IndexedBlockRDD                           => Some((indexed, None))
+      case project @ Project(_, child: IndexedBlockRDD)       => Some((child, Some(project)))
+      case project @ Project(_, innerProject @ Project(_, _)) =>
+        // Recursively handle nested Projects (rare but possible)
+        unapply(innerProject) match {
+          case Some((indexed, _)) => Some((indexed, Some(project)))
+          case None               => None
+        }
+      case _ => None
+    }
+  }
+
+  // ===========================================================================
   // Join Condition Validation
   // ===========================================================================
 
@@ -220,6 +273,43 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
   }
 
   /**
+   * Checks if a join can use the left side's index when Project is present.
+   *
+   * Similar to [[joiningIndexedColumnLeft]] but handles cases where a Project
+   * sits between the IndexedBlockRDD and the Join.
+   *
+   * @param left         The left side of the join (Project over IndexedBlockRDD)
+   * @param indexedChild The underlying IndexedBlockRDD
+   * @param right        The right side of the join
+   * @param joinType     The type of join
+   * @param condition    The join condition
+   * @return true if the join can use the index
+   */
+  def joiningIndexedColumnLeftThroughProject(
+      left: LogicalPlan,
+      indexedChild: IndexedBlockRDD,
+      right: LogicalPlan,
+      joinType: JoinType,
+      condition: Option[Expression]
+  ): Boolean = {
+    Join(left, right, joinType, condition, JoinHint.NONE) match {
+      case ExtractEquiJoinKeys(_, leftKeys, _, _, _, lChild, _, _) =>
+        if (leftKeys.length != 1) return false
+        // The join key must be in the Project's output AND match the indexed column
+        val leftKey = leftKeys.head
+        // Find which column in the original IndexedBlockRDD the join key maps to
+        val indexedColNo = indexedChild.rdd.colNo
+        val indexedAttr = indexedChild.output(indexedColNo)
+        // Check if the join key references the indexed column
+        leftKey match {
+          case attr: AttributeReference => attr.exprId == indexedAttr.exprId
+          case _                        => false
+        }
+      case _ => false
+    }
+  }
+
+  /**
    * Checks if a join can use the right side's index.
    *
    * Same logic as [[joiningIndexedColumnLeft]] but for the right side.
@@ -238,6 +328,33 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
         if (rightKeys.length != 1) return false
         val rightColNo = rChild.output.indexWhere(_.semanticEquals(rightKeys.head))
         rightColNo == right.rdd.colNo
+      case _ => false
+    }
+  }
+
+  /**
+   * Checks if a join can use the right side's index when Project is present.
+   *
+   * Similar to [[joiningIndexedColumnRight]] but handles cases where a Project
+   * sits between the IndexedBlockRDD and the Join.
+   */
+  def joiningIndexedColumnRightThroughProject(
+      left: LogicalPlan,
+      right: LogicalPlan,
+      indexedChild: IndexedBlockRDD,
+      joinType: JoinType,
+      condition: Option[Expression]
+  ): Boolean = {
+    Join(left, right, joinType, condition, JoinHint.NONE) match {
+      case ExtractEquiJoinKeys(_, _, rightKeys, _, _, _, rChild, _) =>
+        if (rightKeys.length != 1) return false
+        val rightKey = rightKeys.head
+        val indexedColNo = indexedChild.rdd.colNo
+        val indexedAttr = indexedChild.output(indexedColNo)
+        rightKey match {
+          case attr: AttributeReference => attr.exprId == indexedAttr.exprId
+          case _                        => false
+        }
       case _ => false
     }
   }
@@ -354,6 +471,46 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
       IndexedJoin(left, right.asInstanceOf[IndexedOperator], joinType, condition)
 
     // -------------------------------------------------------------------------
+    // Rule 2b: Indexed Join through Project (Left Side Indexed)
+    // -------------------------------------------------------------------------
+    // Handles cases where Catalyst's ColumnPruning has inserted a Project
+    // between the IndexedBlockRDD and the Join. We detect this pattern and
+    // convert to IndexedJoin, then apply the Project after the join.
+    //
+    // Before:
+    //   Join
+    //   ├── Project [subset]
+    //   │   └── IndexedBlockRDD [all columns]
+    //   └── other
+    //
+    // After:
+    //   Project [subset ++ other.output]
+    //   └── IndexedJoin
+    //       ├── IndexedBlockRDD [all columns]
+    //       └── other
+
+    case Join(ExtractIndexedBlockRDD(indexedChild, Some(project)), right, joinType @ Inner, condition, _)
+        if joiningIndexedColumnLeftThroughProject(project, indexedChild, right, joinType, condition) =>
+      // Create IndexedJoin using the full IndexedBlockRDD (not the projected subset)
+      val indexedJoin = IndexedJoin(indexedChild.asInstanceOf[IndexedOperator], right, joinType, condition)
+      // Apply projection to the join output to maintain expected schema
+      // The project's expressions reference the IndexedBlockRDD's attributes,
+      // which are still valid in the IndexedJoin's output
+      val projectExprs = project.projectList ++ right.output
+      Project(projectExprs, indexedJoin)
+
+    // -------------------------------------------------------------------------
+    // Rule 3b: Indexed Join through Project (Right Side Indexed)
+    // -------------------------------------------------------------------------
+    // Same as Rule 2b but for the right side.
+
+    case Join(left, ExtractIndexedBlockRDD(indexedChild, Some(project)), joinType @ Inner, condition, _)
+        if joiningIndexedColumnRightThroughProject(left, project, indexedChild, joinType, condition) =>
+      val indexedJoin = IndexedJoin(left, indexedChild.asInstanceOf[IndexedOperator], joinType, condition)
+      val projectExprs = left.output ++ project.projectList
+      Project(projectExprs, indexedJoin)
+
+    // -------------------------------------------------------------------------
     // Rule 4: IsNotNull Elimination
     // -------------------------------------------------------------------------
     // Removes redundant IsNotNull checks on indexed data.
@@ -396,5 +553,15 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
           _
         ) if joinSameFilterColumns(condition, conditionLeft, conditionRight) =>
       IndexedJoin(left, rightChild.asInstanceOf[IndexedOperator], joinType, Some(condition))
+
+    // -------------------------------------------------------------------------
+    // Rule 7: Flatten Nested Projects
+    //   Rule 2b and 3b may introduce nested Projects.
+    //   This rule flattens them to simplify the plan.
+    // -------------------------------------------------------------------------
+
+    case Project(projectList, child @ Project(_, child2)) =>
+      // Flatten nested Projects
+      Project(projectList, child2)
   }
 }
