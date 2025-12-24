@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory
 
 import scala.collection.concurrent.TrieMap
 import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.storage.StorageLevel
 
 /**
  * Catalyst optimization rules for Indexed DataFrame operations.
@@ -133,10 +134,10 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
    * @param plan The physical plan to execute or retrieve from cache
    * @return The IRDD containing indexed partition data
    */
-  private def getIfCached(plan: SparkPlan): IRDD = {
+  private def getIfCached(plan: SparkPlan, storageLevel: StorageLevel): IRDD = {
     val result = cachedPlan.get(plan)
     if (result == None) {
-      val executedPlan = Utils.ensureCached(plan.asInstanceOf[IndexedOperatorExec].executeIndexed())
+      val executedPlan = Utils.ensureCached(plan.asInstanceOf[IndexedOperatorExec].executeIndexed(), storageLevel)
       cachedPlan.put(plan, executedPlan)
       executedPlan
     } else {
@@ -332,8 +333,8 @@ object ConvertToIndexedOperators extends Rule[LogicalPlan] {
     // Converts InMemoryRelation (Spark's cache representation) with an indexed
     // child into IndexedBlockRDD for subsequent indexed operations.
 
-    case InMemoryRelationMatcher(output, _, child: IndexedOperatorExec) =>
-      IndexedBlockRDD(output, getIfCached(child), child)
+    case InMemoryRelationMatcher(output, storageLevel, child: IndexedOperatorExec) =>
+      IndexedBlockRDD(output, getIfCached(child, storageLevel), child)
 
     // -------------------------------------------------------------------------
     // Rule 2: Indexed Join (Left Side Indexed)

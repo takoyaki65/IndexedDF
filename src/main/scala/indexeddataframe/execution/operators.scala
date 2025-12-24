@@ -101,8 +101,9 @@ case class CreateIndexExec(override val indexColNo: Int, child: SparkPlan) exten
         (partitionId, rowIter) => Iterator(Utils.doIndexing(indexColNo, rowIter, outputAttrs, rddId, partitionId)),
         preservesPartitioning = true
       )
-    val ret = new IRDD(indexColNo, partitions)
-    Utils.ensureCached(ret)
+    // Don't cache here - let ConvertToIndexedOperators.getIfCached handle caching
+    // with the correct storage level from InMemoryRelation
+    new IRDD(indexColNo, partitions)
   }
 }
 
@@ -126,9 +127,8 @@ case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, override v
   ): IndexedBlockRDDScanExec = this
 
   override def executeIndexed(): IRDD = {
-    logger.debug("executing the cache() operator")
-
-    Utils.ensureCached(rdd)
+    // rdd is already cached by ConvertToIndexedOperators.getIfCached with the correct storage level
+    rdd
   }
 }
 
@@ -174,7 +174,7 @@ case class IndexedFilterExec(condition: Expression, child: SparkPlan) extends Un
     eq match {
       case EqualTo(_, lit: Literal) => Some(lit)
       case EqualTo(lit: Literal, _) => Some(lit)
-      case _ => None
+      case _                        => None
     }
   }
 

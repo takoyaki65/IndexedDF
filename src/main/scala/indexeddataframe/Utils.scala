@@ -44,8 +44,7 @@ object Utils {
     * @tparam T
     * @return
     */
-  def ensureCached[T](rdd: IRDD, storageLevel: StorageLevel = StorageLevel.MEMORY_ONLY): IRDD = {
-    // println(rdd.getStorageLevel + " --------- " + storageLevel)
+  def ensureCached[T](rdd: IRDD, storageLevel: StorageLevel): IRDD = {
     if (rdd.getStorageLevel == StorageLevel.NONE) {
       rdd.persist(storageLevel)
     } else {
@@ -86,6 +85,9 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedPartition])
     partitionsRDD = partitionsRDD.persist(newLevel)
     this
   }
+
+  /** Returns the storage level of the underlying partitionsRDD */
+  override def getStorageLevel: StorageLevel = partitionsRDD.getStorageLevel
 
   /** RDD function that returns an RDD of the rows containing the search key
     * @param key
