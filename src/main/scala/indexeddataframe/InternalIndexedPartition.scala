@@ -209,8 +209,28 @@ class InternalIndexedPartition extends Serializable {
   /**
    * Projection for removing the #prev column from rows returned by get().
    * Takes a row with (original columns + prev) and projects to (original columns only).
+   * Lazily initialized to support deserialization from disk (DISK_ONLY storage level).
    */
-  @transient private var removePrevProjection: UnsafeProjection = null
+  @transient private var _removePrevProjection: UnsafeProjection = null
+
+  /**
+   * Returns the projection for removing #prev column, initializing lazily if needed.
+   * This lazy initialization is required because:
+   * - The projection is @transient (not serialized to disk)
+   * - After deserialization from DISK_ONLY, we need to recreate it
+   * - schema and nColumns are preserved through serialization
+   */
+  private def getRemovePrevProjection: UnsafeProjection = {
+    if (_removePrevProjection == null && schema != null) {
+      val rightField = new StructField("prev", LongType)
+      val schemaWithPrev = schema.add(rightField)
+      val projectionExprs = (0 until nColumns).map { i =>
+        BoundReference(i, schemaWithPrev(i).dataType, schemaWithPrev(i).nullable)
+      }
+      _removePrevProjection = UnsafeProjection.create(projectionExprs)
+    }
+    _removePrevProjection
+  }
 
   // =====================================================================================
   // Initialization and setup
@@ -263,14 +283,8 @@ class InternalIndexedPartition extends Serializable {
     // Generate code for joining rows with the #prev column
     this.backwardPointerJoiner = GenerateCustomUnsafeRowJoiner.create(schema, rightSchema)
 
-    // Create projection to remove #prev column when returning rows from get()
-    // Input schema: original columns + prev, Output schema: original columns only
-    // Use BoundReference to specify which columns to project from the input row
-    val schemaWithPrev = schema.add(rightField)
-    val projectionExprs = (0 until nColumns).map { i =>
-      BoundReference(i, schemaWithPrev(i).dataType, schemaWithPrev(i).nullable)
-    }
-    this.removePrevProjection = UnsafeProjection.create(projectionExprs)
+    // Note: removePrevProjection is lazily initialized via getRemovePrevProjection
+    // This supports deserialization from disk where @transient fields become null
   }
 
   // =====================================================================================
@@ -564,7 +578,7 @@ class InternalIndexedPartition extends Serializable {
       currentPointer = rowWithPrev.getLong(nColumns)
 
       // Project to remove #prev column before returning
-      removePrevProjection(rowWithPrev)
+      getRemovePrevProjection(rowWithPrev)
     }
   }
 

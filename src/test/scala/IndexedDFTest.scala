@@ -1,6 +1,7 @@
 package indexeddataframe
 
 import org.apache.spark.sql._
+import org.apache.spark.storage.StorageLevel
 import org.scalatest.funsuite.AnyFunSuite
 import indexeddataframe.implicits._
 import indexeddataframe.logical.ConvertToIndexedOperators
@@ -1458,5 +1459,233 @@ class IndexedDFTest extends AnyFunSuite {
     val count = result.collect().length
     println(s"Join with BETWEEN-like predicate result: $count rows (expected: 2)")
     assert(count == 2, s"Expected 2 rows but got $count")
+  }
+
+  // ============================================
+  // DISK_ONLY storage level tests
+  // Tests for serialization/deserialization support
+  // ============================================
+
+  test("DISK_ONLY - getRows after deserialization") {
+    // Test: persist with DISK_ONLY and verify getRows works after deserialization
+    val df = Seq(
+      (1, "a1"),
+      (1, "a2"),
+      (2, "b1"),
+      (3, "c1")
+    ).toDF("id", "value")
+
+    // Create index with DISK_ONLY storage level
+    val indexed = df.createIndex(0).persist(StorageLevel.DISK_ONLY)
+
+    // Force materialization to disk
+    indexed.count()
+
+    // Unpersist from executor memory to ensure data comes from disk
+    // Note: In local mode, this simulates deserialization
+
+    // Test getRows - this should use the lazily initialized removePrevProjection
+    val rows = indexed.getRows(1)
+    val collected = rows.collect()
+
+    println("=== DISK_ONLY getRows Result ===")
+    rows.show()
+
+    assert(collected.length == 2, s"Expected 2 rows for key=1 but got ${collected.length}")
+    // Verify data integrity - values should be "a1" and "a2"
+    val values = collected.map(_.getString(1)).sorted
+    assert(values.sameElements(Array("a1", "a2")), s"Expected values [a1, a2] but got ${values.mkString("[", ", ", "]")}")
+
+    indexed.unpersist()
+  }
+
+  test("DISK_ONLY - join after deserialization") {
+    // Test: persist with DISK_ONLY and verify join works after deserialization
+    val dfA = Seq(
+      (1, "a1"),
+      (2, "a2"),
+      (3, "a3")
+    ).toDF("id", "valA")
+
+    val dfB = Seq(
+      (1, "b1"),
+      (2, "b2")
+    ).toDF("id", "valB")
+
+    // Create index with DISK_ONLY storage level
+    val indexedA = dfA.createIndex(0).persist(StorageLevel.DISK_ONLY)
+
+    // Force materialization to disk
+    indexedA.count()
+
+    indexedA.createOrReplaceTempView("disk_only_a")
+    dfB.createOrReplaceTempView("disk_only_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM disk_only_a
+      JOIN disk_only_b ON disk_only_a.id = disk_only_b.id
+    """)
+
+    println("=== DISK_ONLY Join Result ===")
+    result.explain(true)
+    result.show()
+
+    val collected = result.collect()
+    assert(collected.length == 2, s"Expected 2 rows but got ${collected.length}")
+
+    // Verify data integrity
+    val ids = collected.map(_.getInt(0)).sorted
+    assert(ids.sameElements(Array(1, 2)), s"Expected ids [1, 2] but got ${ids.mkString("[", ", ", "]")}")
+
+    indexedA.unpersist()
+  }
+
+  test("DISK_ONLY - multiple operations after deserialization") {
+    // Test: multiple operations on DISK_ONLY indexed DF
+    val df = Seq(
+      (1, 100),
+      (1, 200),
+      (2, 300),
+      (3, 400),
+      (3, 500),
+      (3, 600)
+    ).toDF("id", "value")
+
+    val indexed = df.createIndex(0).persist(StorageLevel.DISK_ONLY)
+
+    // Force materialization
+    indexed.count()
+
+    // First operation: getRows(1)
+    val rows1 = indexed.getRows(1).collect()
+    assert(rows1.length == 2, s"getRows(1): Expected 2 rows but got ${rows1.length}")
+
+    // Second operation: getRows(3)
+    val rows3 = indexed.getRows(3).collect()
+    assert(rows3.length == 3, s"getRows(3): Expected 3 rows but got ${rows3.length}")
+
+    // Third operation: collect all
+    val all = indexed.collect()
+    assert(all.length == 6, s"collect(): Expected 6 rows but got ${all.length}")
+
+    println("=== DISK_ONLY Multiple Operations - All Passed ===")
+    indexed.unpersist()
+  }
+
+  test("DISK_ONLY - join with non-equi predicate") {
+    // Test: DISK_ONLY with non-equi join predicate
+    val dfA = Seq(
+      (1, 100),
+      (2, 200),
+      (3, 50)
+    ).toDF("id", "value")
+
+    val dfB = Seq(
+      (1, 80), // value(100) > 80 = true
+      (2, 250), // value(200) > 250 = false
+      (3, 40) // value(50) > 40 = true
+    ).toDF("id", "threshold")
+
+    val indexedA = dfA.createIndex(0).persist(StorageLevel.DISK_ONLY)
+
+    // Force materialization
+    indexedA.count()
+
+    indexedA.createOrReplaceTempView("disk_only_nonequi_a")
+    dfB.createOrReplaceTempView("disk_only_nonequi_b")
+
+    val result = sparkSession.sql("""
+      SELECT * FROM disk_only_nonequi_a a
+      JOIN disk_only_nonequi_b b ON a.id = b.id AND a.value > b.threshold
+    """)
+
+    println("=== DISK_ONLY Join with Non-Equi Predicate Result ===")
+    result.show()
+
+    val collected = result.collect()
+    assert(collected.length == 2, s"Expected 2 rows but got ${collected.length}")
+
+    val ids = collected.map(_.getInt(0)).sorted
+    assert(ids.sameElements(Array(1, 3)), s"Expected ids [1, 3] but got ${ids.mkString("[", ", ", "]")}")
+
+    indexedA.unpersist()
+  }
+
+  test("DISK_ONLY - string key index") {
+    // Test: DISK_ONLY with string key index
+    val df = Seq(
+      ("key1", 100),
+      ("key1", 200),
+      ("key2", 300),
+      ("key3", 400)
+    ).toDF("key", "value")
+
+    val indexed = df.createIndex(0).persist(StorageLevel.DISK_ONLY)
+
+    // Force materialization
+    indexed.count()
+
+    // Test getRows with string key
+    val rows = indexed.getRows("key1".asInstanceOf[AnyVal]).collect()
+
+    println("=== DISK_ONLY String Key getRows Result ===")
+    indexed.getRows("key1".asInstanceOf[AnyVal]).show()
+
+    assert(rows.length == 2, s"Expected 2 rows for key='key1' but got ${rows.length}")
+
+    indexed.unpersist()
+  }
+
+  test("DISK_ONLY vs MEMORY_ONLY - result consistency") {
+    // Test: verify DISK_ONLY produces same results as MEMORY_ONLY
+    val df = Seq(
+      (1, "a"),
+      (2, "b"),
+      (3, "c"),
+      (1, "d"),
+      (2, "e")
+    ).toDF("id", "value")
+
+    val dfJoin = Seq(
+      (1, "x"),
+      (2, "y")
+    ).toDF("id", "extra")
+
+    // Create MEMORY_ONLY indexed DF
+    val memoryIndexed = df.createIndex(0).persist(StorageLevel.MEMORY_ONLY)
+    memoryIndexed.count()
+
+    // Create DISK_ONLY indexed DF
+    val diskIndexed = df.createIndex(0).persist(StorageLevel.DISK_ONLY)
+    diskIndexed.count()
+
+    // Compare getRows results
+    val memoryRows = memoryIndexed.getRows(1).collect().map(r => (r.getInt(0), r.getString(1))).sorted
+    val diskRows = diskIndexed.getRows(1).collect().map(r => (r.getInt(0), r.getString(1))).sorted
+    assert(memoryRows.sameElements(diskRows), "getRows results should be identical for MEMORY_ONLY and DISK_ONLY")
+
+    // Compare join results
+    memoryIndexed.createOrReplaceTempView("memory_indexed")
+    diskIndexed.createOrReplaceTempView("disk_indexed")
+    dfJoin.createOrReplaceTempView("join_table")
+
+    val memoryJoinResult = sparkSession.sql("""
+      SELECT memory_indexed.id, value, extra FROM memory_indexed
+      JOIN join_table ON memory_indexed.id = join_table.id
+      ORDER BY memory_indexed.id, value
+    """).collect().map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+
+    val diskJoinResult = sparkSession.sql("""
+      SELECT disk_indexed.id, value, extra FROM disk_indexed
+      JOIN join_table ON disk_indexed.id = join_table.id
+      ORDER BY disk_indexed.id, value
+    """).collect().map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+
+    assert(memoryJoinResult.sameElements(diskJoinResult), "Join results should be identical for MEMORY_ONLY and DISK_ONLY")
+
+    println("=== DISK_ONLY vs MEMORY_ONLY Consistency - Verified ===")
+
+    memoryIndexed.unpersist()
+    diskIndexed.unpersist()
   }
 }
