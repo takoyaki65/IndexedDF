@@ -27,7 +27,7 @@ object IndexedOperators extends SparkStrategy {
     case IndexedFilter(condition, child) => IndexedFilterExec(condition, planLater(child)) :: Nil
     case IndexedJoin(left, right, joinType, condition) =>
       Join(left, right, joinType, condition, JoinHint.NONE) match {
-        case ExtractEquiJoinKeys(_, leftKeys, rightKeys, otherPredicates, _, lChild, rChild, _) =>
+        case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, otherPredicates, conditionOnJoinKeys, lChild, rChild, _) =>
           // compute the index of the left side keys == column number
           // Use semanticEquals to compare attributes as they may have different metadata
           val leftColNo = lChild.output.indexWhere(_.semanticEquals(leftKeys.head))
@@ -40,9 +40,11 @@ object IndexedOperators extends SparkStrategy {
           IndexedShuffledEquiJoinExec(
             planLater(left),
             planLater(right),
+            joinType,
             leftColNo,
             rightColNo,
-            otherPredicates.toSeq
+            otherPredicates.toSeq,
+            conditionOnJoinKeys
           ) :: Nil
         case _ => Nil
       }

@@ -8,6 +8,7 @@ import indexeddataframe.{IRDD, InternalIndexedPartition, Utils}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.catalyst.plans.JoinType
 import org.slf4j.LoggerFactory
 
 trait LeafExecNode extends SparkPlan {
@@ -187,16 +188,20 @@ case class IndexedFilterExec(condition: Expression, child: SparkPlan) extends Un
  *
  * @param left            The indexed DataFrame (left side of join)
  * @param right           A regular DataFrame (right side of join)
+ * @param joinType        Type of join (Inner ONLY), currently only used for logging
  * @param leftCol         Column index for join key on the left table
  * @param rightCol        Column index for join key on the right table
  * @param otherPredicates Non-equi join predicates to apply after the equi-join
+ * @param joinCondition  Original join condition (not used in this implementation)
  */
 case class IndexedShuffledEquiJoinExec(
     left: SparkPlan,
     right: SparkPlan,
+    joinType: JoinType,
     leftCol: Int,
     rightCol: Int,
-    otherPredicates: Seq[Expression] = Seq.empty
+    otherPredicates: Seq[Expression] = Seq.empty,
+    joinCondition: Option[Expression] = None
 ) extends BinaryExecNode {
   private val logger = LoggerFactory.getLogger(classOf[IndexedShuffledEquiJoinExec])
 
