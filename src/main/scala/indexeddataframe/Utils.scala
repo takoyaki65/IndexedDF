@@ -112,6 +112,17 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedPartition])
 
   }
 
+  /**
+    * Returns the total size in bytes of all partitions in this IRDD.
+    * This is used for Catalyst statistics to enable proper join strategy selection.
+    *
+    * Note: This triggers an RDD action if the RDD is not cached. For cached RDDs,
+    * the computation is efficient as InternalIndexedPartition tracks totalMemoryUsed.
+    */
+  def sizeInBytes: Long = {
+    partitionsRDD.map(_.totalMemoryUsed).reduce(_ + _)
+  }
+
   /** multiget method used in the broadcast join
     * @param rightRDD
     * @param leftSchema

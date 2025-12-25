@@ -5,10 +5,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression}
 import org.apache.spark.sql.catalyst.plans.JoinType
-import org.apache.spark.sql.catalyst.plans.logical.{BinaryNode, LeafNode, LogicalPlan, UnaryNode}
+import org.apache.spark.sql.catalyst.plans.logical.{BinaryNode, LeafNode, LogicalPlan, Statistics, UnaryNode}
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.catalyst.plans.logical.Statistics
-import org.apache.spark.util.LongAccumulator
 
 /**
  * Logical operators for Indexed DataFrame operations.
@@ -233,9 +231,7 @@ case class IndexedLocalRelation(output: Seq[Attribute], data: Seq[InternalRow]) 
  * @param rdd    The underlying indexed RDD containing InternalIndexedPartition data
  * @param child  The original SparkPlan used to create this indexed data
  */
-case class IndexedBlockRDD(output: Seq[Attribute], rdd: IRDD, child: SparkPlan) extends IndexedOperator with MultiInstanceRelation {
-
-  override def children: Seq[LogicalPlan] = Nil
+case class IndexedBlockRDD(output: Seq[Attribute], rdd: IRDD, child: SparkPlan) extends LeafNode with IndexedOperator with MultiInstanceRelation {
 
   /**
    * Creates a copy of this relation with new expression IDs.
@@ -248,21 +244,26 @@ case class IndexedBlockRDD(output: Seq[Attribute], rdd: IRDD, child: SparkPlan) 
   /** All output attributes are produced by this operator (no pass-through) */
   override def producedAttributes: AttributeSet = outputSet
 
-  override protected def withNewChildrenInternal(
-      newChildren: IndexedSeq[LogicalPlan]
-  ): IndexedBlockRDD = this
-
-  /*
-  override lazy val statistics: Statistics = {
-    val batchStats: LongAccumulator = child.sqlContext.sparkContext.longAccumulator
-    /*if (batchStats.value == 0L) {
-      Statistics(sizeInBytes = org.apache.spark.sql.internal.SQLConf.DEFAULT_SIZE_IN_BYTES.defaultValue.get)
-    } else {
-      Statistics(sizeInBytes = batchStats.value.longValue)
-    }*/
-    Statistics(0)
-  }
+  /**
+   * Computes statistics for this indexed relation.
+   *
+   * Returns the actual size in bytes of the indexed data. This is critical for
+   * proper join strategy selection - without accurate statistics, Spark may
+   * incorrectly choose to broadcast large indexed tables, causing driver OOM.
+   *
+   * The size is computed by summing totalMemoryUsed across all partitions.
+   * Since the RDD should be cached when used in queries, this is efficient.
    */
+  override def computeStats(): Statistics = {
+    try {
+      val size = rdd.sizeInBytes
+      Statistics(sizeInBytes = size)
+    } catch {
+      // If RDD is not materialized yet, return a large default to prevent broadcast
+      case _: Exception =>
+        Statistics(sizeInBytes = Long.MaxValue)
+    }
+  }
 }
 
 // =============================================================================
