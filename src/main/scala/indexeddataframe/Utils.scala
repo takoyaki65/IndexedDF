@@ -123,6 +123,16 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedPartition])
     partitionsRDD.map(_.totalMemoryUsed).reduce(_ + _)
   }
 
+  /** Returns the total number of rows in all partitions in this IRDD.
+   * This is used for Catalyst statistics to enable proper join strategy selection.
+   * 
+   * Note: This triggers an RDD action if the RDD is not cached. For cached RDDs,
+   * the computation is efficient as InternalIndexedPartition tracks nRows.
+    */
+  def rowCount: Long = {
+    partitionsRDD.map(_.nRows).reduce(_ + _)
+  }
+
   /** multiget method used in the broadcast join
     * @param rightRDD
     * @param leftSchema

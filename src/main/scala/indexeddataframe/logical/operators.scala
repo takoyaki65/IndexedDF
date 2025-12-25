@@ -257,7 +257,8 @@ case class IndexedBlockRDD(output: Seq[Attribute], rdd: IRDD, child: SparkPlan) 
   override def computeStats(): Statistics = {
     try {
       val size = rdd.sizeInBytes
-      Statistics(sizeInBytes = size)
+      val rowCount = rdd.rowCount
+      Statistics(sizeInBytes = size, rowCount = Some(rowCount))
     } catch {
       // If RDD is not materialized yet, return a large default to prevent broadcast
       case _: Exception =>
