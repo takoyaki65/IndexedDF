@@ -78,7 +78,7 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedPartition])
   override protected def getPartitions: Array[Partition] = partitionsRDD.partitions
 
   override def compute(part: Partition, context: TaskContext): Iterator[InternalRow] = {
-    firstParent[InternalIndexedPartition].iterator(part, context).next.iterator
+    firstParent[InternalIndexedPartition].iterator(part, context).next().iterator()
   }
 
   override def persist(newLevel: StorageLevel): this.type = {
@@ -153,7 +153,7 @@ class IRDD(val colNo: Int, var partitionsRDD: RDD[InternalIndexedPartition])
         val res = part
           .next()
           .multigetJoinedRight(
-            rightRDD.value.toIterator,
+            rightRDD.value.iterator,
             joiner,
             rightOutput,
             joinRightCol

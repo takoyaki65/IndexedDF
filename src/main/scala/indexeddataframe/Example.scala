@@ -11,7 +11,8 @@ import org.apache.spark.sql.types._
 object Example {
 
   def main(args: Array[String]): Unit = {
-    val sparkSession = SparkSession.builder
+    val sparkSession = SparkSession
+      .builder()
       .master("local[*]")
       .appName("IndexedDF Example")
       .config("spark.sql.shuffle.partitions", "4")
@@ -244,7 +245,8 @@ object BenchmarkPrograms {
     val partitions = args(4)
     val master = args(5)
 
-    val sparkSession = SparkSession.builder
+    val sparkSession = SparkSession
+      .builder()
       .master(master)
       .appName("IndexedDF Benchmark")
       .config("spark.sql.shuffle.partitions", partitions)
@@ -318,7 +320,8 @@ object BenchmarkPrograms {
     println("Running with in-memory sample data...")
     println()
 
-    val sparkSession = SparkSession.builder
+    val sparkSession = SparkSession
+      .builder()
       .master("local[*]")
       .appName("IndexedDF Benchmark (Sample Data)")
       .config("spark.sql.shuffle.partitions", "4")
