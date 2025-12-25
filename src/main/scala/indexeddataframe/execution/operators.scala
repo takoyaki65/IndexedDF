@@ -9,7 +9,10 @@ import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.sql.catalyst.plans.JoinType
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.slf4j.LoggerFactory
+import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import scala.concurrent.duration.NANOSECONDS
 
 trait LeafExecNode extends SparkPlan {
   override final def children: Seq[SparkPlan] = Nil
@@ -42,7 +45,7 @@ trait IndexedOperatorExec extends SparkPlan {
 
   /** if the indexed operator is required to return rows (i.e., as for a regular spark DF operations) produce its rows by scanning the index
     */
-  override def doExecute() = {
+  override def doExecute(): RDD[InternalRow] = {
     executeIndexed()
   }
 
@@ -116,7 +119,6 @@ case class CreateIndexExec(override val indexColNo: Int, child: SparkPlan) exten
 case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, override val indexColNo: Int, numPartitions: Int)
     extends LeafExecNode
     with IndexedOperatorExec {
-  private val logger = LoggerFactory.getLogger(classOf[IndexedBlockRDDScanExec])
 
   // Declare the output partitioning as hash partitioned on the index column
   // Tell spark not to shuffle after this operator
@@ -126,9 +128,55 @@ case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, override v
       newChildren: IndexedSeq[SparkPlan]
   ): IndexedBlockRDDScanExec = this
 
+  // SQLMetrics for monitoring scan performance
+  override lazy val metrics: Map[String, SQLMetric] = Map(
+    "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time"),
+    "dataSize" -> SQLMetrics.createSizeMetric(sparkContext, "size of data read"),
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows")
+  )
+
   override def executeIndexed(): IRDD = {
     // rdd is already cached by ConvertToIndexedOperators.getIfCached with the correct storage level
     rdd
+  }
+
+  override def doExecute(): RDD[InternalRow] = {
+    val scanTimeMetric = longMetric("scanTime")
+    val dataSizeMetric = longMetric("dataSize")
+    val numOutputRowsMetric = longMetric("numOutputRows")
+
+    rdd.partitionsRDD.mapPartitions { partitionIter =>
+      val startTime = System.nanoTime()
+
+      if (partitionIter.hasNext) {
+        val indexedPartition = partitionIter.next()
+
+        // Measure data size (totalMemoryUsed tracks the actual bytes stored)
+        dataSizeMetric += indexedPartition.totalMemoryUsed
+        numOutputRowsMetric += indexedPartition.nRows.toLong
+
+        // Create an iterator that counts rows and measures time
+        val baseIterator = indexedPartition.iterator()
+        new Iterator[InternalRow] {
+
+          override def hasNext: Boolean = {
+            val has = baseIterator.hasNext
+            if (!has) {
+              // When iteration completes, record timing and row count
+              val endTime = System.nanoTime()
+              scanTimeMetric += NANOSECONDS.toMillis(endTime - startTime) // Convert to milliseconds
+            }
+            has
+          }
+
+          override def next(): InternalRow = {
+            baseIterator.next()
+          }
+        }
+      } else {
+        Iterator.empty
+      }
+    }
   }
 }
 
@@ -231,29 +279,10 @@ case class IndexedShuffledEquiJoinExec(
   ): IndexedShuffledEquiJoinExec =
     copy(left = newChildren(0), right = newChildren(1))
 
-  /**
-   * Applies non-equi predicates to filter joined rows.
-   *
-   * Binds the predicate expressions to the output schema and evaluates them
-   * for each row. Only rows satisfying all predicates are returned.
-   */
-  private def applyOtherPredicates(result: RDD[InternalRow]): RDD[InternalRow] = {
-    if (otherPredicates.isEmpty) {
-      result
-    } else {
-      val outputAttrs = output
-      val predicates = otherPredicates
-      result.mapPartitions { iter =>
-        // Bind predicates to output schema inside the partition
-        val boundPredicates = predicates.map { pred =>
-          BindReferences.bindReference(pred, outputAttrs)
-        }
-        iter.filter { row =>
-          boundPredicates.forall(_.eval(row).asInstanceOf[Boolean])
-        }
-      }
-    }
-  }
+  val leftSchema = StructType(left.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
+  val rightSchema = StructType(right.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
+  val rightOutputAttrs = right.output
+  val leftOutputAttrs = left.output
 
   // helper method to find the IndexedOperatorExec in the plan tree
   private def findIndexedOp(plan: SparkPlan): Option[IndexedOperatorExec] = {
@@ -263,44 +292,183 @@ case class IndexedShuffledEquiJoinExec(
     }
   }
 
+  // check which side is indexed AND whether join column matches the indexed column
+  val leftIndexedOp = findIndexedOp(left)
+  val rightIndexedOp = findIndexedOp(right)
+
+  // Only use the indexed side if the join column matches the indexed column
+  val useLeftIndex = leftIndexedOp.exists(op => op.indexColNo == leftCol)
+  val useRightIndex = rightIndexedOp.exists(op => op.indexColNo == rightCol)
+
+  // Which side can we use the index on
+  // If left side is indexed and join column matches index column, use left index
+  // Else if right side is indexed and join column matches index column, use right index
+  // If both sides are indexed and match, prefer left side
+  val canUseLeftIndex = leftIndexedOp.isDefined && useLeftIndex
+  val canUseRightIndex = rightIndexedOp.isDefined && useRightIndex
+
+  // SQLMetrics for monitoring join performance
+  override lazy val metrics: Map[String, SQLMetric] = Map(
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
+    "numLeftInputRows" -> SQLMetrics.createMetric(sparkContext, f"number of left input rows (${if (canUseLeftIndex) "indexed" else "probe"})"),
+    "numRightInputRows" -> SQLMetrics
+      .createMetric(sparkContext, f"number of right input rows (${if (!canUseLeftIndex && canUseRightIndex) "indexed" else "probe"})"),
+    "joinTime" -> SQLMetrics.createTimingMetric(sparkContext, "join time"),
+    "filterTime" -> SQLMetrics.createTimingMetric(sparkContext, "filter time")
+  )
+
+  val noFiltering = otherPredicates.isEmpty
+
+  /**
+   * Applies non-equi predicates to filter joined rows.
+   *
+   * Binds the predicate expressions to the output schema and evaluates them
+   * for each row. Only rows satisfying all predicates are returned.
+   */
+  private def applyOtherPredicates(result: RDD[InternalRow]): RDD[InternalRow] = {
+    val numOutputRowsMetric = longMetric("numOutputRows")
+    val filterTimeMetric = longMetric("filterTime")
+
+    if (otherPredicates.isEmpty) {
+      result
+    } else {
+      val outputAttrs = output
+      val predicates = otherPredicates
+      var numOutputRows = 0L
+      val startTime = System.nanoTime()
+      result.mapPartitions { iter =>
+        // Bind predicates to output schema inside the partition
+        val boundPredicates = predicates.map { pred =>
+          BindReferences.bindReference(pred, outputAttrs)
+        }
+        val filterResult = iter
+          .filter { row =>
+            boundPredicates.forall(_.eval(row).asInstanceOf[Boolean])
+          }
+
+        // Wrap the filtered result to count output rows and measure time
+        new Iterator[InternalRow] {
+          override def hasNext: Boolean = {
+            val has = filterResult.hasNext
+            if (!has) {
+              // Finalize metrics
+              numOutputRowsMetric += numOutputRows
+              val endTime = System.nanoTime()
+              filterTimeMetric += NANOSECONDS.toMillis(endTime - startTime)
+            }
+            has
+          }
+          override def next(): InternalRow = {
+            numOutputRows += 1L
+            filterResult.next()
+          }
+        }
+      }
+    }
+  }
+
   override def doExecute(): RDD[InternalRow] = {
     logger.debug("in the Shuffled JOIN operator")
+    val joinTimeMetric = longMetric("joinTime")
+    val numLeftInputRowsMetric = longMetric("numLeftInputRows")
+    val numRightInputRowsMetric = longMetric("numRightInputRows")
+    val numOutputRowsMetric = longMetric("numOutputRows")
 
-    val leftSchema = StructType(left.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
-    val rightSchema = StructType(right.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
-
-    // check which side is indexed AND whether join column matches the indexed column
-    val leftIndexedOp = findIndexedOp(left)
-    val rightIndexedOp = findIndexedOp(right)
-
-    // Only use the indexed side if the join column matches the indexed column
-    val useLeftIndex = leftIndexedOp.exists(op => op.indexColNo == leftCol)
-    val useRightIndex = rightIndexedOp.exists(op => op.indexColNo == rightCol)
-
-    val equiJoinResult = (useLeftIndex, useRightIndex, leftIndexedOp, rightIndexedOp) match {
-      case (true, _, Some(indexedLeft), _) =>
+    val equiJoinResult = (canUseLeftIndex, canUseRightIndex) match {
+      case (true, _) =>
+        // left side (indexed) & right side (probe)
+        val indexedLeft = leftIndexedOp.get
         val leftRDD = indexedLeft.executeIndexed()
         val rightRDD = right.execute()
 
         leftRDD.partitionsRDD.zipPartitions(rightRDD, true) { (leftIter, rightIter) =>
-          // generate an unsafe row joiner
-          // Note: InternalIndexedPartition.get() returns rows WITHOUT prev column
+          val startTime = System.nanoTime()
           val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
+
           if (leftIter.hasNext) {
-            leftIter.next().multigetJoinedRight(rightIter, joiner, right.output, rightCol)
+            val indexedPartition = leftIter.next()
+            var numLeftLookupedRows = 0L
+            var numRightRows = 0L
+            var numOutputRows = 0L
+
+            val joinResult = rightIter.flatMap { rightRow =>
+              numRightRows += 1L
+              val rightKey = rightRow.get(rightCol, rightSchema(rightCol).dataType).asInstanceOf[AnyVal]
+              indexedPartition.get(rightKey).map { leftRow =>
+                numLeftLookupedRows += 1L
+                numOutputRows += 1L
+                joiner.join(leftRow.asInstanceOf[UnsafeRow], rightRow.asInstanceOf[UnsafeRow])
+              }
+            }
+
+            // Wrap the join result to measure time
+            new Iterator[InternalRow] {
+              override def hasNext: Boolean = {
+                val has = joinResult.hasNext
+                if (!has) {
+                  // Finalize metrics
+                  numLeftInputRowsMetric += numLeftLookupedRows
+                  numRightInputRowsMetric += numRightRows
+                  if (noFiltering) {
+                    // If no filtering, numOutputRowsMetric is already counted during join
+                    numOutputRowsMetric += numOutputRows
+                  }
+                  val endTime = System.nanoTime()
+                  joinTimeMetric += NANOSECONDS.toMillis(endTime - startTime)
+                }
+                has
+              }
+              override def next(): InternalRow = joinResult.next()
+            }
           } else Iterator.empty
         }
 
-      case (_, true, _, Some(indexedRight)) =>
+      case (_, true) =>
+        // left side (probe) & right side (indexed)
+        val indexedRight = rightIndexedOp.get
         val leftRDD = left.execute()
         val rightRDD = indexedRight.executeIndexed()
 
         rightRDD.partitionsRDD.zipPartitions(leftRDD, true) { (rightIter, leftIter) =>
-          // generate an unsafe row joiner
-          // Note: InternalIndexedPartition.get() returns rows WITHOUT prev column
+          val startTime = System.nanoTime()
           val joiner = GenerateUnsafeRowJoiner.create(leftSchema, rightSchema)
+
           if (rightIter.hasNext) {
-            rightIter.next().multigetJoinedLeft(leftIter, joiner, left.output, leftCol)
+            val indexedPartition = rightIter.next()
+            var numRightLookupedRows = 0L
+            var numLeftRows = 0L
+            var numOutputRows = 0L
+
+            // Wrap the join result to measure time
+            val joinResult = leftIter.flatMap { leftRow =>
+              numLeftRows += 1L
+              val leftKey = leftRow.get(leftCol, leftSchema(leftCol).dataType).asInstanceOf[AnyVal]
+              indexedPartition.get(leftKey).map { rightRow =>
+                numRightLookupedRows += 1L
+                if (noFiltering) {
+                  // Count output rows directly if no filtering is applied
+                  numOutputRows += 1L
+                }
+                joiner.join(leftRow.asInstanceOf[UnsafeRow], rightRow.asInstanceOf[UnsafeRow])
+              }
+            }
+            new Iterator[InternalRow] {
+              override def hasNext: Boolean = {
+                val has = joinResult.hasNext
+                if (!has) {
+                  // Finalize metrics
+                  numLeftInputRowsMetric += numLeftRows
+                  numRightInputRowsMetric += numRightLookupedRows
+                  if (noFiltering) {
+                    // If no filtering, numOutputRowsMetric is already counted during join
+                    numOutputRowsMetric += numOutputRows
+                  }
+                  joinTimeMetric += NANOSECONDS.toMillis(System.nanoTime() - startTime)
+                }
+                has
+              }
+              override def next(): InternalRow = joinResult.next()
+            }
           } else Iterator.empty
         }
 
@@ -312,6 +480,7 @@ case class IndexedShuffledEquiJoinExec(
     }
 
     // Apply non-equi predicates (e.g., a.value > b.threshold) after the equi-join
+    // Count output rows after predicate filtering if any predicates exist
     applyOtherPredicates(equiJoinResult)
   }
 
