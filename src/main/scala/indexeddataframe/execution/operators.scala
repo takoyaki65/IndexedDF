@@ -137,6 +137,10 @@ case class IndexedBlockRDDScanExec(output: Seq[Attribute], rdd: IRDD, override v
 
   override def executeIndexed(): IRDD = {
     // rdd is already cached by ConvertToIndexedOperators.getIfCached with the correct storage level
+    val dataSizeMetric = longMetric("dataSize")
+    val numOutputRowsMetric = longMetric("numOutputRows")
+    dataSizeMetric += rdd.sizeInBytes
+    numOutputRowsMetric += rdd.rowCount.toLong
     rdd
   }
 
